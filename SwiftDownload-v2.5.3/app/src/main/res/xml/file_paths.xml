@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- v1.0 行为保持：FileProvider 共享已下载文件（公共下载目录） -->
+    <external-path name="downloads" path="Download/" />
+    <!-- v2.5：Android 11+ 分区存储降级到应用专属外部目录时，仍需可被分享/打开 -->
+    <external-files-path name="app_downloads" path="Download/" />
+    <external-files-path name="app_root" path="." />
+    <files-path name="internal" path="." />
+    <cache-path name="cache" path="." />
+</paths>

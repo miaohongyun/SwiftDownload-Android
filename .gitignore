@@ -1,0 +1,8 @@
+# WorkBuddy 内部工作记录
+.workbuddy/
+
+# Gradle 缓存与构建产物
+.gradle/
+**/build/
+**/.cxx/
+local.properties
