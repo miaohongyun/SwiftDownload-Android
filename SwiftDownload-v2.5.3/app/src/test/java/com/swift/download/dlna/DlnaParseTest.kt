@@ -94,6 +94,24 @@ class DlnaParseTest {
         assertTrue(soap.contains("&lt;dc:title&gt;"))
     }
 
+    @Test fun `pickLanAddress优先wlan并过滤VPN虚拟网卡`() {
+        // tun0 排在前面且是 10.x，必须被跳过，选中 wlan0 的真实网段
+        val withVpn = listOf(
+            Dlna.NetCandidate("tun0", "10.8.0.2"),
+            Dlna.NetCandidate("dummy0", "172.19.1.3"),
+            Dlna.NetCandidate("wlan0", "192.168.1.9"),
+            Dlna.NetCandidate("eth0", "192.168.2.5")
+        )
+        assertEquals("192.168.1.9", Dlna.pickLanAddress(withVpn))
+        // 没有 wlan 时退回 eth
+        assertEquals("192.168.2.5", Dlna.pickLanAddress(withVpn.filter { it.ifName != "wlan0" }))
+        // 全是虚拟网卡时返回 null，而不是给出打不开的 VPN 地址
+        assertEquals(null, Dlna.pickLanAddress(withVpn.filter { it.ifName.startsWith("tun") || it.ifName.startsWith("dummy") }))
+        // 172.x 只接受 16..31 的私有段
+        assertEquals(null, Dlna.pickLanAddress(listOf(Dlna.NetCandidate("wlan0", "172.40.0.1"))))
+        assertEquals("172.20.0.7", Dlna.pickLanAddress(listOf(Dlna.NetCandidate("wlan0", "172.20.0.7"))))
+    }
+
     @Test fun `escapeXml 五类字符`() {
         assertEquals("&amp;&lt;&gt;&quot;&apos;", Dlna.escapeXml("&<>\"'"))
     }

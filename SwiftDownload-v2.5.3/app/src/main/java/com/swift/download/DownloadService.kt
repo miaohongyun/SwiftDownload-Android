@@ -20,6 +20,8 @@ import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
 import com.swift.download.bt.TorrentEngine
+import com.swift.download.player.Backing
+import com.swift.download.player.ContentUriBacking
 import com.swift.download.player.FileBacking
 import com.swift.download.player.M3u8Job
 import com.swift.download.player.M3u8
@@ -259,26 +261,28 @@ class DownloadService : Service() {
     /** 投屏/本地播已完成文件：本地文件服务器（支持 Range，供电视拖进度） */
     fun serveFile(path: String): String? {
         var f = File(path)
-        if (!f.isFile) {
-            // v2.6.0：已导出到公共 Download 的文件在部分 ROM 上无法用 File 直读，
-            // 改用 MediaStore URI 拷贝一份到缓存目录供投屏服务器读取。
-            val t = tasks.values.firstOrNull { it.savePath == path && it.exportUri.isNotBlank() }
-            if (t != null) {
-                val tmp = File(cacheDir, "cast_${t.id}_${File(path).name}")
-                try {
-                    contentResolver.openInputStream(android.net.Uri.parse(t.exportUri))?.use { input ->
-                        tmp.outputStream().use { out -> input.copyTo(out) }
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "serveFile exported copy", e)
-                }
-                if (tmp.isFile) f = tmp
-            }
-            if (!f.isFile) return null
+        // v2.6.0：已导出到 MediaStore 的文件优先零拷贝投屏 —— 不再把 2~4GB 电影
+        // 整份复制进 cacheDir，改用 ParcelFileDescriptor 随机定位直接 Range 读。
+        val exported = tasks.values.firstOrNull {
+            (it.savePath == path || it.exportUri == path) && it.exportUri.isNotBlank()
         }
         val ip = com.swift.download.dlna.Dlna.lanIp()
         stopServeFile()
-        val server = StreamServer(FileBacking(f, MediaTypes.mimeOf(f.name)))
+        val backing: Backing = when {
+            exported != null -> {
+                val uri = try { android.net.Uri.parse(exported.exportUri) } catch (e: Exception) { null }
+                val size = if (exported.totalBytes > 0) exported.totalBytes else f.length()
+                if (uri == null || size <= 0) return null
+                ContentUriBacking(
+                    openPfd = { try { contentResolver.openFileDescriptor(uri, "r") } catch (e: Exception) { null } },
+                    size = size,
+                    mime = MediaTypes.mimeOf(exported.fileName)
+                )
+            }
+            f.isFile -> FileBacking(f, MediaTypes.mimeOf(f.name))
+            else -> return null
+        }
+        val server = StreamServer(backing)
         server.start()
         fileServer = server
         acquireCastLocks()
@@ -361,6 +365,17 @@ class DownloadService : Service() {
         lanRemote?.stop()
         lanRemote = null
         maybeStopForeground()
+    }
+
+    /** v2.6.0：删除 MediaStore 导出的文件条目；失败不阻断任务删除 */
+    private fun deleteExportedFile(t: DownloadTask) {
+        if (t.exportUri.isBlank()) return
+        try {
+            val uri = android.net.Uri.parse(t.exportUri)
+            contentResolver.delete(uri, null, null)
+        } catch (e: Exception) {
+            Log.w(TAG, "deleteExportedFile", e)
+        }
     }
 
     private fun releaseCastLocks() {
@@ -1017,6 +1032,7 @@ class DownloadService : Service() {
         // 2. 旧链接的半成品与断点状态不能带到新链接上
         File(t.savePath + ".part").delete()
         File(t.savePath + ".m3u8state").delete()
+        com.swift.download.player.M3u8Job.deleteCacheDir(t.savePath)
         File(t.dirFile(), DownloadEngine.Segments.progFileName(id)).delete()
 
         // 3. 新链接可能换了类型和清晰度：重新判定 kind / 文件名 / 落盘路径
@@ -1082,12 +1098,17 @@ class DownloadService : Service() {
         if (withFiles) {
             File(t.savePath).delete()
             File(t.savePath + ".part").delete()
+            // v2.6.0：Phase 2 导出后正式文件在 MediaStore（content://），
+            // File.delete() 对 content URI 无效 —— 必须同时删除媒体库条目
+            deleteExportedFile(t)
         }
         // v2.5：无论是否删除文件，断点进度文件都必须清理。
         // 否则"仅删任务"会留下孤儿 .swiftprog，占用空间且可能被后续任务误读。
         File(t.dirFile(), DownloadEngine.Segments.progFileName(id)).delete()
-        // m3u8 续传状态文件同理
+        // m3u8 续传状态文件同理；v2.6.0：并发分片缓存目录也必须清理，
+        // 否则删任务后 .hls/ 里的分片会长期残留
         File(t.savePath + ".m3u8state").delete()
+        com.swift.download.player.M3u8Job.deleteCacheDir(t.savePath)
         db.delete(id)
         tasks.remove(id)
         samplers.remove(id)
@@ -1463,7 +1484,9 @@ fun DownloadEngine.DownloadJob.writeProgressIfActive() {
         f.parentFile?.mkdirs()
         // 原子替换：进程在写中途被杀时不会留下截断的 .swiftprog（否则整个断点丢失）
         val tmp = File(dir, "${f.name}.tmp")
-        tmp.writeText(snapshot().entries.joinToString("\n") { "${it.key} ${it.value}" })
+        // v2.6.0：写三列（start end bytes）。动态切分后的非静态区间必须落盘，
+        // 否则暂停/重启时 prepare() 认不出这些起点，会把进度清零从头下载。
+        tmp.writeText(snapshotEntries().joinToString("\n") { "${it.start} ${it.end} ${it.bytes}" })
         if (f.exists() && !f.delete()) { tmp.delete(); return }
         if (!tmp.renameTo(f)) tmp.delete()
     } catch (e: Exception) {

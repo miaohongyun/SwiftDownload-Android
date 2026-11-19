@@ -11,8 +11,8 @@ android {
         applicationId = "com.swift.download"
         minSdk = 24
         targetSdk = 36
-        versionCode = 10
-        versionName = "2.5.3"
+        versionCode = 11
+        versionName = "2.6.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 

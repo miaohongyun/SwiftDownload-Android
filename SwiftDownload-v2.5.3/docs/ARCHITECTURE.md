@@ -218,3 +218,58 @@ MainActivity（四页主壳 / Intent 接管 / 浮层 / 投屏与边播接线）
   会抛 "not mocked"，把 `catch` 里的错误回调整个吞掉，故障路径在测试中表现为"无响应"。
 
 运行：`./gradlew testDebugUnitTest`；构建：`./gradlew assembleRelease`。
+
+---
+
+# v2.6.0 架构增量
+
+以下是对上面基础架构的增量说明，不替代原有章节。
+
+## 新增模块
+
+| 模块 | 职责 |
+| --- | --- |
+| `HttpUtil` | 统一连接打开器：手动跟踪 301/302/303/307/308（含跨协议、最多 5 跳），每跳重放 Range/Referer/Cookie/UA；全局唯一 UA 常量 |
+| `QueueRules` | 并发队列上限（1–5）与等待原因的纯逻辑 |
+| `BtTaskRules` | BT 任务终态保护（PAUSED/FAILED 不被 ticker 覆盖） |
+| `ListenerOnceGuard` | 防止 `shutdown()` 后重建 session 时重复注册同一个 alertListener |
+| `MediaStoreExport` | 完成后经 `MediaStore.Downloads` 导出公共目录，路径/分类纯函数 |
+| `FileHash` / `HashDialog` | 一次流式读计算 MD5/SHA-1/SHA-256；比对按长度识别算法 |
+| `M3u8Crypto` | AES-128 CBC/PKCS5Padding 解密、IV 解析（显式或序号大端） |
+| `BtFileSelection` | 文件优先级映射、越界过滤、最大视频、就绪判定纯逻辑 |
+| `remote/LanRemoteProtocol` + `LanRemoteServer` | 局域网 Web 投递：纯 JDK ServerSocket + 内嵌单页控制台 |
+
+## 线程模型增量
+
+- **Work Stealing**：分段线程池固定大小；某段完成后在 `stealLock` 内扫描剩余量最大的慢段，
+  原子收缩其 `segEnds` 并登记新分段，再由同一线程池接管后半段。慢段线程每次写盘后在锁内
+  按当前终点截断计数，因此"切分"与"计数"串行，验收口径与动态区间一致。
+- **HLS**：主worker 线程 + 4 线程分片池；分片只写 `.hls/seg_N.bin`（先 `.tmp` 后原子改名），
+  主worker 按序从缓存拼入 `.part`，每片更新 `.m3u8state`。失败重试指数退避 100/200/400ms。
+- **DLNA 保活**：`serveFile()` 期间持 PARTIAL_WAKE_LOCK（10 分钟超时）与 WIFI 高性能锁，
+  `stopServeFile()`/空闲回收/`onDestroy()` 三处释放。
+
+## 数据完整性约束增量（在原 6 条之后）
+
+7. **动态分段断点**：`.swiftprog` 由两列（start bytes）扩展为三列（start end bytes），
+   旧两列按静态 `Segments.split` 补齐终点。恢复时用 `Segments.isResumable` 校验区间
+   从 0 开始、首尾相接、完整覆盖文件，再按持久化区间重建 `segCounters/segEnds`，
+   不再用静态起点集合过滤。`.part` 长度校验只统计 `bytes > 0` 的分段，
+   避免把"尚未开始但起点很大"的新分段误计入。
+8. **HLS 分片缓存**：`.hls/` 在任务完成、删除、刷新链接、重新下载四条路径都要清理；
+   临时分片先写 `.tmp` 再原子改名，被强杀时只留 `.tmp`，下次重新下载，绝不把半片拼进文件。
+9. **MediaStore 文件**：导出后 `savePath` 变为公共路径、`exportUri` 记录 content URI。
+   删除任务需同时 `contentResolver.delete(exportUri)`；投屏用 `ParcelFileDescriptor`
+   随机定位零拷贝（不复制整文件）；文件可用性判定为"File 存在 或 exportUri 非空"。
+
+## 存储迁移
+
+`DB_VERSION` 从 3 升到 4，只做三条 `ALTER TABLE ADD COLUMN`：
+`cookie` / `user_agent` / `export_uri`，均为 `TEXT NOT NULL DEFAULT ''`，既有任务行零改动。
+
+## 已知架构债增量
+
+- 局域网面板无鉴权，仅适合可信网络临时开启；固定端口 8877（已设 reuseAddress）。
+- `Dlna.lanIp()` 通过 `pickLanAddress` 过滤 tun/tap/ppp/dummy 等虚拟网卡并优先 wlan/eth，
+  但仍无法覆盖所有厂商的自定义网卡命名。
+- 未知 Content-Length 的流不支持断点续传（无可靠分段边界）。

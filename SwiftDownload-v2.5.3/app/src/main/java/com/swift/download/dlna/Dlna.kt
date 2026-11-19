@@ -224,22 +224,46 @@ object Dlna {
     }
 
     /** 本机局域网 IPv4（投屏地址用；无局域网返回 null） */
+    data class NetCandidate(val ifName: String, val address: String)
+
+    /**
+     * v2.6.0：从候选网卡里挑局域网 IP。VPN/代理生成的 tun0/ppp0/dummy 常是
+     * 10.x 或 172.x，若排在 wlan0 前面会让电视/电脑访问到一个不存在的地址。
+     * 规则：先排除虚拟网卡名，再优先 wlan/eth，最后才是其它物理网卡。
+     */
+    fun pickLanAddress(candidates: List<NetCandidate>): String? {
+        val physical = candidates.filter { c ->
+            val n = c.ifName.lowercase()
+            !VIRTUAL_IFACE.any { n.startsWith(it) }
+        }
+        fun firstUsable(pool: List<NetCandidate>): String? = pool
+            .firstOrNull { c ->
+                val h = c.address
+                h.startsWith("192.168.") || h.startsWith("10.") ||
+                    (h.startsWith("172.") && h.split('.').getOrNull(1)?.toIntOrNull()
+                        ?.let { it in 16..31 } == true)
+            }?.address
+        return firstUsable(physical.filter { it.ifName.startsWith("wlan", true) })
+            ?: firstUsable(physical.filter { it.ifName.startsWith("eth", true) })
+            ?: firstUsable(physical)
+    }
+
+    private val VIRTUAL_IFACE = listOf("tun", "tap", "ppp", "dummy", "lo", "vbox", "vmnet", "awdl", "bridge")
+
     fun lanIp(): String? {
         return try {
             val en = java.net.NetworkInterface.getNetworkInterfaces() ?: return null
+            val candidates = ArrayList<NetCandidate>()
             for (ni in en) {
                 if (!ni.isUp || ni.isLoopback) continue
                 for (addr in ni.interfaceAddresses) {
                     val a = addr.address
                     if (a is java.net.Inet4Address && !a.isLoopbackAddress) {
-                        val host = a.hostAddress ?: continue
-                        if (host.startsWith("192.168.") || host.startsWith("10.") ||
-                            host.startsWith("172.")
-                        ) return host
+                        a.hostAddress?.let { candidates.add(NetCandidate(ni.name, it)) }
                     }
                 }
             }
-            null
+            pickLanAddress(candidates)
         } catch (e: Exception) {
             null
         }

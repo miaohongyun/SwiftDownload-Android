@@ -226,11 +226,27 @@ class M3u8Job(
         worker?.interrupt()
     }
 
-    private fun deleteCache() {
-        val dir = cacheDir()
-        if (!dir.isDirectory) return
-        try { dir.listFiles()?.forEach { it.delete() } } catch (e: Exception) {}
-        try { dir.delete() } catch (e: Exception) {}
+    private fun deleteCache() = deleteCacheDir(savePath)
+
+    companion object {
+        /**
+         * v2.6.0：递归清理 HLS 分片缓存目录。删除任务/刷新链接/重新下载都要调用 ——
+         * 否则长视频被删后 .hls/ 里的几百 MB 分片会长期残留成为孤儿。
+         * 纯文件操作，JVM 单测可直接覆盖。
+         */
+        fun deleteCacheDir(savePath: String) {
+            val dir = File(savePath + ".hls")
+            if (!dir.isDirectory) return
+            try {
+                dir.listFiles()?.forEach { child ->
+                    if (child.isDirectory) child.listFiles()?.forEach { it.delete() }
+                    child.delete()
+                }
+                dir.delete()
+            } catch (e: Exception) {
+                // 清理失败不影响主流程，最多留下可被下次清理的残留
+            }
+        }
     }
 
     /**

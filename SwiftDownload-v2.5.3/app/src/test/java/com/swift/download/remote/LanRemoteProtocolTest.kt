@@ -57,6 +57,28 @@ class LanRemoteProtocolTest {
     }
 
     @Test
+    fun serverBindsAndReleasesPortImmediately() {
+        val controller = object : LanRemoteServer.Controller {
+            override fun tasksJson(): String = "[]"
+            override fun addUrl(url: String): Boolean = true
+            override fun addTorrent(fileName: String, bytes: ByteArray): Boolean = true
+        }
+        val socket = java.net.ServerSocket(0)
+        val port = socket.localPort
+        socket.close() // 制造 TIME_WAIT 高发场景
+        val first = LanRemoteServer(controller, port)
+        assertEquals(port, first.start())
+        first.stop()
+        // 快速重启必须能立刻再绑定同一端口（reuseAddress=true 的验证）
+        val second = LanRemoteServer(controller, port)
+        try {
+            assertEquals(port, second.start())
+        } finally {
+            second.stop()
+        }
+    }
+
+    @Test
     fun resultJson() {
         assertEquals("{\"ok\":true,\"msg\":\"已添加\"}", LanRemoteProtocol.resultJson(true, "已添加"))
     }

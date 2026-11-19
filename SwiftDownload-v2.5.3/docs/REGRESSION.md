@@ -308,3 +308,32 @@ E2E-A 的 `.part` 残留并非断言写错：`segDone()` 在 `RandomAccessFile` 
 - 全量单测：**90/90 通过**（清理前后用例数与断言均未变，证明删除未改变行为）。
 - 版本：`versionCode 10 / versionName 2.5.3`；「我的」页与「关于」改为从 `PackageManager` 读取版本，
   修掉此前硬编码 `v2.5.1` 与实际版本脱节的问题。
+
+---
+
+# v2.6.0 增量回归（四阶段 + 交叉检查）
+
+- 门禁：每个 Phase 完成均运行 `./gradlew testDebugUnitTest`。
+- 用例增长：v2.5.3 的 90 → Phase1 101 → Phase2 111 → Phase3 121 → Phase4 132 → 交叉检查 139。
+- 最终：**139/139 通过，0 失败，0 跳过**。
+
+## 分阶段验证要点
+
+| 阶段 | 新增测试 | 关键断言 |
+| --- | --- | --- |
+| Phase 1 | StreamServerTest 4 / Phase1RegressionTest 6 / 完整性 1 | HEAD 无 body、并发 Range 不错位、改名避让、listener 防重、线程池已关闭 |
+| Phase 2 | 完整性 4 / Phase2RegressionTest 6 | 302 跨端口、404 不生成文件、Chunked 完成、Cookie 生效、DB v4 列、队列上限 |
+| Phase 3 | Phase3RegressionTest 8 / M3u8Test +2 | 慢连接触发接管且文件完整、加密 HLS 逐字节一致、AES 往返、BYTERANGE、BT 优先级 |
+| Phase 4 | FileHashTest 4 / LanRemoteProtocolTest 5 / DlnaParseTest +1 / M3u8Test +1 | 哈希标准向量、协议 JSON/HTML、DIDL 元数据、嗅探格式与提取 |
+| 交叉检查 | Phase5RegressionTest 4 / StreamServerTest +1 / DlnaParseTest +1 / LanRemoteProtocolTest +1 | 动态断点续传、缓存递归清理、多 Key、零拷贝读路径、VPN 网卡过滤、端口复用 |
+
+## 交叉检查发现并修复的真实缺陷
+
+1. **动态断点被误判失效**：`.swiftprog` 两列格式无法表达动态分段终点，静态 split 校验会否掉
+   新起点导致整段重下。改为三列持久化 + 按区间还原；`.part` 长度校验同步修正（只算有数据的段）。
+   端到端测试断言恢复请求是 `bytes=200000-300000` 而非 `bytes=0-`。
+2. **HLS 缓存孤儿**：`.hls/` 未纳入删除/刷新链接清理；已抽 `M3u8Job.deleteCacheDir` 统一处理。
+3. **MediaStore 投屏双倍空间**：原实现完整复制到 cacheDir；改为 `ContentUriBacking` 用
+   `ParcelFileDescriptor` 随机定位零拷贝，用假 Backing 测试确保 pump 走 `readAt` 分支。
+4. **VPN 网卡误选**：`lanIp` 可能返回 tun0 的 10.x 地址；`pickLanAddress` 过滤虚拟网卡并优先 wlan。
+5. `FileHash.compare` 曾先剥冒号导致 `sha256:` 前缀识别失效；调整顺序并加测试。

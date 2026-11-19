@@ -464,7 +464,7 @@ class MainActivity : AppCompatActivity() {
     private fun showAbout() {
         android.app.AlertDialog.Builder(this)
             .setTitle("极速下载")
-            .setMessage("v$versionLabel\n\n· 多线程 HTTP 下载 · 断点续传\n· 磁力聚合搜索（5 源）\n· BT 引擎（jlibtorrent）\n· 内置多标签浏览器 · 书签管理\n· 浏览器视频嗅探 · 清晰度可选下载\n· 边下边播（HTTP 视频）\n· DLNA 投屏 · 文件排序/分享/重命名\n· 限速 / 仅 Wi-Fi / 时段调度 / 文件分类\n· 链接刷新 / HTTP 代理 / m3u8 下载\n\nv2.5.3 为代码清理与文档完善版，下载行为与 v2.5.2 一致。\nv2.5.2 修复下载完整性：服务器不守规矩时不再产出“已完成”的坏文件。")
+            .setMessage("v$versionLabel\n\n· 多线程 HTTP 下载 · 断点续传 · 慢连接智能接管\n· 磁力聚合搜索（5 源）· BT 选文件 / 顺序下载\n· 内置多标签浏览器 · 嗅探角标 · 剪贴板识别\n· HLS 加密流（AES-128）/ 清晰度可选下载\n· 边下边播（零拷贝）· DLNA 投屏（DIDL 元数据）\n· 限速 / 仅 Wi-Fi / 时段调度 / 并发队列 / 文件分类\n· 完成后导出公共下载 · MD5/SHA 校验 · 局域网投递\n\nv2.6.0 修复并发竞态、线程池泄漏、API 24 启动兼容，\n并新增 HLS 解密、Work Stealing、Cookie 透传、MediaStore 导出。")
             .setPositiveButton("确定", null)
             .show()
     }
@@ -606,6 +606,22 @@ class MainActivity : AppCompatActivity() {
             binder?.restartTask(id)
         }
         override fun openFile(path: String) {
+            // v2.6.0：MediaStore 导出的文件用 content URI 直接唤起系统查看器，
+            // FileProvider 只接受应用私有目录下的 File，对公共 Download 路径无能为力
+            val exported = lastTasks.firstOrNull { it.savePath == path && it.exportUri.isNotBlank() }
+            if (exported != null) {
+                try {
+                    val uri = android.net.Uri.parse(exported.exportUri)
+                    val mime = com.swift.download.MediaTypes.mimeOf(exported.fileName)
+                    val view = android.content.Intent(android.content.Intent.ACTION_VIEW)
+                        .setDataAndType(uri, mime)
+                        .addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    startActivity(android.content.Intent.createChooser(view, "打开文件"))
+                    return
+                } catch (e: Exception) {
+                    // 回退到 FileProvider
+                }
+            }
             sendBroadcast(OpenFileReceiver.intentOf(path).setPackage(packageName))
         }
         override fun streamTask(id: Long) { this@MainActivity.streamTask(id) }

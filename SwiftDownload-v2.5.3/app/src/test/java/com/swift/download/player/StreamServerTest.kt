@@ -7,6 +7,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
 import java.io.InputStream
+import java.io.RandomAccessFile
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -189,6 +190,39 @@ class StreamServerTest {
             assertEquals("6789", b.get(10, TimeUnit.SECONDS))
         } finally {
             pool.shutdownNow()
+            server.stop()
+        }
+    }
+
+    @Test(timeout = 30_000)
+    fun `readAt数据源零拷贝路径支持任意Range且不开RAF`() {
+        // 模拟 ContentUriBacking：supportsReadAt=true，readDisk/backingFile 都会抛异常。
+        // 若 pump 仍走老路径，测试必然失败 —— 以此守住零拷贝投屏的分支。
+        val content = ByteArray(64) { it.toByte() }
+        val fake = object : Backing {
+            override fun total(): Long = content.size.toLong()
+            override fun contentType(): String = "video/mp4"
+            override fun backingFile(): File = throw UnsupportedOperationException("无 File 路径")
+            override fun readDisk(raf: RandomAccessFile, offset: Long, len: Int, out: ByteArray): Int =
+                throw UnsupportedOperationException("不应打开 RAF")
+            override fun supportsReadAt(): Boolean = true
+            override fun readAt(offset: Long, len: Int, out: ByteArray): Int {
+                val n = minOf(len, content.size - offset.toInt()).coerceAtLeast(0)
+                System.arraycopy(content, offset.toInt(), out, 0, n)
+                return if (n > 0) n else -1
+            }
+            override fun diskRunEnd(offset: Long): Long = content.size.toLong()
+            override fun fetch(offset: Long, out: ByteArray, len: Int): Int = -1
+        }
+        val server = StreamServer(fake)
+        val port = server.start()
+        try {
+            val a = exchange(port, getRaw("bytes=10-19")).body
+            assertEquals(10, a.size)
+            assertEquals((10..19).map { it.toByte() }, a.toList())
+            val b = exchange(port, getRaw("bytes=60-63")).body
+            assertEquals((60..63).map { it.toByte() }, b.toList())
+        } finally {
             server.stop()
         }
     }

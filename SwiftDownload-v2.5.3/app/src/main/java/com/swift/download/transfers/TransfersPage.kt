@@ -61,6 +61,9 @@ class TransfersPage(
         fun setTaskLimit(id: Long, bps: Long)
         /** v2.6.0：从持久化设置回读所有任务限速值（重启后仍能回显） */
         fun taskLimits(): Map<Long, Long> = emptyMap()
+        /** v2.6.0：文件是否仍可用（兼容 MediaStore content:// 导出文件） */
+        fun fileAvailable(t: DownloadTask): Boolean =
+            java.io.File(t.savePath).isFile || t.exportUri.isNotBlank()
         /* v2.6.0：BT 选文件 / 顺序下载 / 就绪即播 */
         fun btFiles(id: Long): List<com.swift.download.bt.BtFile> = emptyList()
         fun setBtFileSelection(id: Long, selected: IntArray): Boolean = false
@@ -547,10 +550,11 @@ class TransfersPage(
                         Ui.BLUE,
                         primary = true
                     ) { controller.openFile(t.savePath) })
-                    if (MediaTypes.isVideoName(t.fileName) && java.io.File(t.savePath).isFile) {
+                    val available = controller.fileAvailable(t)
+                    if (MediaTypes.isVideoName(t.fileName) && available) {
                         actions.addFlow(action(ctx, "投屏", Ui.GREEN) { controller.castTask(t.savePath) })
                     }
-                    if (java.io.File(t.savePath).isFile) {
+                    if (available) {
                         actions.addFlow(action(ctx, "校验哈希", Ui.TXT_SUB) {
                             com.swift.download.HashDialog.show(ctx, java.io.File(t.savePath))
                         })

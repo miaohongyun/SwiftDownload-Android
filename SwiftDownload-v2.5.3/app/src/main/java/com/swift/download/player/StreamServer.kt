@@ -121,6 +121,17 @@ interface Backing {
     fun backingFile(): File
     /** 读盘上已存在的字节（保证 onDisk 才会调） */
     fun readDisk(raf: RandomAccessFile, offset: Long, len: Int, out: ByteArray): Int
+
+    /**
+     * v2.6.0：自包含读取。默认走 [readDisk]；MediaStore content URI 等无法用
+     * RandomAccessFile 打开的数据源覆写它，用 ParcelFileDescriptor 随机定位，
+     * 零拷贝投屏 —— 不必把 2~4GB 视频整份复制进 cacheDir。
+     */
+    fun readAt(offset: Long, len: Int, out: ByteArray): Int = -1
+
+    /** readAt 是否可用；false 时 pump 仍走 readDisk + RAF */
+    fun supportsReadAt(): Boolean = false
+
     /** offset 起连续在盘上的右端（独占） */
     fun diskRunEnd(offset: Long): Long
     /**
@@ -257,6 +268,63 @@ class FileBacking(private val file: File, private val mime: String) : Backing {
     override fun readDisk(raf: RandomAccessFile, offset: Long, len: Int, out: ByteArray): Int {
         raf.seek(offset)
         return raf.read(out, 0, len)
+    }
+}
+
+/**
+ * v2.6.0：MediaStore 已导出文件的零拷贝投屏数据源。
+ * 用 contentResolver.openFileDescriptor(uri, "r") 拿 ParcelFileDescriptor，
+ * 通过 FileInputStream.channel.position(offset) 随机定位 —— 不复制大文件到 cacheDir，
+ * 也不依赖 File 直读（Android 11+ 对 content URI 没有可读文件路径）。
+ */
+class ContentUriBacking(
+    private val openPfd: () -> android.os.ParcelFileDescriptor?,
+    private val size: Long,
+    private val mime: String
+) : Backing {
+    @Volatile private var pfd: android.os.ParcelFileDescriptor? = null
+    @Volatile private var input: java.io.FileInputStream? = null
+    private val readLock = Any()
+
+    override fun total(): Long = size
+    override fun contentType(): String = mime
+    override fun backingFile(): File = throw UnsupportedOperationException("content URI 没有 File 路径")
+    override fun diskRunEnd(offset: Long): Long = size
+    override fun fetch(offset: Long, out: ByteArray, len: Int): Int = -1
+    override fun readDisk(raf: RandomAccessFile, offset: Long, len: Int, out: ByteArray): Int = -1
+    override fun supportsReadAt(): Boolean = true
+
+    @Synchronized
+    override fun readAt(offset: Long, len: Int, out: ByteArray): Int {
+        if (offset >= size) return -1
+        val stream = synchronized(readLock) {
+            input ?: openPfd()?.let { descriptor ->
+                pfd = descriptor
+                java.io.FileInputStream(descriptor.fileDescriptor).also { input = it }
+            }
+        } ?: return -1
+        return synchronized(readLock) {
+            try {
+                stream.channel.position(offset)
+                var got = 0
+                while (got < len) {
+                    val n = stream.read(out, got, len - got)
+                    if (n <= 0) break
+                    got += n
+                }
+                if (got > 0) got else -1
+            } catch (e: Exception) {
+                -1
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        try { input?.close() } catch (e: Exception) {}
+        try { pfd?.close() } catch (e: Exception) {}
+        input = null
+        pfd = null
     }
 }
 
@@ -421,7 +489,10 @@ class StreamServer(
             if (diskEnd > pos) {
                 val len = minOf(buf.size.toLong(), minOf(diskEnd, until) - pos).toInt()
                 if (len <= 0) return
-                val got = synchronized(rafLock) {
+                val got = if (backing.supportsReadAt()) {
+                    // v2.6.0：content URI 零拷贝随机读，不打开 RAF、不复制整文件
+                    backing.readAt(pos, len, buf)
+                } else synchronized(rafLock) {
                     val f = raf ?: openRaf().also { raf = it }
                     backing.readDisk(f, pos, len, buf)
                 }

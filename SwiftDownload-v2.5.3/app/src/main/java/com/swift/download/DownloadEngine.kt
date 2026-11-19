@@ -90,6 +90,40 @@ class DownloadEngine private constructor() {
             return longArrayOf(shrunkEnd, newStart, end)
         }
 
+        /**
+         * v2.6.0：进度记录条目。end 为分段终点闭区间（-1 = 直到文件尾）。
+         * 动态切分后起点不再是静态 split 的结果，必须把起点+终点一起持久化，
+         * 否则暂停/进程被杀后无法还原分段布局，只能整段重下。
+         */
+        data class ProgEntry(val start: Long, val end: Long, val bytes: Long) {
+            companion object {
+                /** 旧格式（两列）的 end 哨兵：恢复时按静态 split 补齐 */
+                const val END_UNKNOWN = Long.MIN_VALUE
+            }
+        }
+
+        /**
+         * 校验进度条目能否安全续传：区间必须从 0 开始、首尾相接、覆盖整个文件，
+         * 每段字节数在合法范围内。动态切分产生的非等长区间同样满足这组不变量。
+         */
+        fun isResumable(entries: List<ProgEntry>, total: Long): Boolean {
+            if (entries.isEmpty() || total <= 0L) return false
+            val sorted = entries.sortedBy { it.start }
+            if (sorted.first().start != 0L) return false
+            for (e in sorted) {
+                if (e.end == ProgEntry.END_UNKNOWN || e.end >= total) return false
+                val len = if (e.end >= 0) e.end - e.start + 1 else total - e.start
+                if (len <= 0L || e.bytes < 0L || e.bytes > len) return false
+            }
+            for (i in 1 until sorted.size) {
+                if (sorted[i - 1].end + 1 != sorted[i].start) return false
+            }
+            val last = sorted.last()
+            // 单线程直下用 end=-1 表示到文件尾，只能是唯一分段
+            if (last.end == -1L) return sorted.size == 1
+            return last.end == total - 1L
+        }
+
         fun progFileName(taskId: Long): String = "$taskId.swiftprog"
     }
 
@@ -225,25 +259,33 @@ class DownloadEngine private constructor() {
                 // 断点数据是否可用：进度文件存在、服务器总大小与上次一致，且分段布局仍然匹配
                 val progFile = File(task.dirFile(), Segments.progFileName(task.id))
                 val segs = if (probe.acceptRanges) Segments.split(probe.totalBytes, task.threads) else null
-                fun expectLen(start: Long): Long {
-                    if (segs == null) return probe.totalBytes
-                    val idx = segs.indexOfFirst { it[0] == start }
-                    return if (idx < 0) -1L else segs[idx][1] - start + 1
+                val rawProg = readProg(progFile)
+                // v2.6.0：旧 .swiftprog 只有两列（start bytes），按静态分段补齐终点；
+                // 新版三列（start end bytes）直接携带 Work Stealing 切出的动态区间。
+                val progEntries = rawProg.mapValues { (start, e) ->
+                    if (e.end != Segments.ProgEntry.END_UNKNOWN) e else {
+                        val end = if (segs == null) -1L
+                        else segs.firstOrNull { it[0] == start }?.let { it[1] }
+                            ?: Segments.ProgEntry.END_UNKNOWN
+                        Segments.ProgEntry(start, end, e.bytes)
+                    }
                 }
-                val progEntries = readProg(progFile)
                 var hasResume = progFile.isFile && task.totalBytes > 0L &&
                     task.totalBytes == probe.totalBytes && progEntries.isNotEmpty()
                 if (hasResume) {
-                    // 线程数/分段数变化，或进度值超出分段长度 → 旧进度不可信，全部重下
-                    hasResume = progEntries.all { (s, v) ->
-                        s in (segs?.map { it[0] } ?: listOf(0L)) && v >= 0L && v <= expectLen(s)
-                    }
+                    // v2.6.0：不再要求起点属于静态 split —— 动态切分的非等长区间只要
+                    // 首尾相接且完整覆盖文件，就是合法断点，必须原样还原。
+                    hasResume = Segments.isResumable(progEntries.values.toList(), probe.totalBytes)
                 }
                 if (hasResume) {
                     // 进度文件存在但 .part 已被删/被截断时，从记录的偏移继续写会留下"空洞"：
                     // 文件长度够、内容却是 0 字节。要求 .part 至少覆盖所有已记录的偏移。
                     val partLen = File(task.savePath + ".part").length()
-                    val maxResumed = progEntries.maxOfOrNull { (s, v) -> s + v } ?: 0L
+                    // v2.6.0：只统计"实际写过字节"的分段。动态切出的新分段起点很大但
+                    // bytes=0，若计入会把 .part 长度要求抬高到那个起点，误判为不匹配。
+                    val maxResumed = progEntries.values
+                        .filter { it.bytes > 0L }
+                        .maxOfOrNull { it.start + it.bytes } ?: 0L
                     if (partLen < maxResumed) {
                         Log.w(TAG, "断点文件与进度不匹配（part=$partLen < $maxResumed），改为重新下载")
                         hasResume = false
@@ -277,36 +319,28 @@ class DownloadEngine private constructor() {
                 working = DownloadTask.Status.RUNNING
                 listener.onStatus(t.copy(status = working))
 
-                val count = if (segs == null) 1 else segs.size
-                pool = Executors.newFixedThreadPool(count)
+                // v2.6.0：恢复时优先使用 .swiftprog 里持久化的（可能是动态的）区间，
+                // 完全跳过静态 split —— 否则动态切出的分段会丢失终点、被误判为无效断点。
+                val ranges = when {
+                    hasResume -> progEntries.values.sortedBy { it.start }
+                        .map { longArrayOf(it.start, it.end, it.bytes) }
+                    segs == null -> listOf(longArrayOf(0L, -1L, 0L))
+                    else -> segs.map { longArrayOf(it[0], it[1], 0L) }
+                }
+                pool = Executors.newFixedThreadPool(ranges.size)
                 // 先登记全部分段计数，再启动线程：
                 // 否则先跑完的分段会看到不完整的 segCounters.size，被误判为"全部完成"
-                val counters = ArrayList<AtomicLong>(count)
-                if (segs == null) {
-                    // 服务器不支持 Range：单线程直下
-                    val resume = if (hasResume) progEntries[0L] ?: 0L else 0L
-                    val c = AtomicLong(resume)
-                    segEnds[0L] = -1L
-                    segCounters[0L] = c
-                    atomicBytes.addAndGet(resume)
+                val counters = ArrayList<AtomicLong>(ranges.size)
+                for (r in ranges) {
+                    val c = AtomicLong(r[2])
+                    segEnds[r[0]] = r[1]
+                    segCounters[r[0]] = c
+                    atomicBytes.addAndGet(r[2])
                     counters.add(c)
-                } else {
-                    for (s in segs) {
-                        val resume = if (hasResume) progEntries[s[0]] ?: 0L else 0L
-                        val c = AtomicLong(resume)
-                        segEnds[s[0]] = s[1]
-                        segCounters[s[0]] = c
-                        atomicBytes.addAndGet(resume)
-                        counters.add(c)
-                    }
                 }
-                if (segs == null) {
-                    pool?.execute { segment(t, 0L, -1L, counters[0]) }
-                } else {
-                    for (i in segs.indices) {
-                        val s = segs[i]
-                        pool?.execute { segment(t, s[0], s[1], counters[i]) }
-                    }
+                for (i in ranges.indices) {
+                    val r = ranges[i]
+                    pool?.execute { segment(t, r[0], r[1], counters[i]) }
                 }
             } catch (e: Exception) {
                 if (!cancelled.get()) {
@@ -329,6 +363,14 @@ class DownloadEngine private constructor() {
 
         /** 各分段已下载字节快照（服务轮询回写 .swiftprog / DB 用） */
         fun snapshot(): Map<Long, Long> = segCounters.mapValues { it.value.get() }
+
+        /**
+         * v2.6.0：带区间终点的快照。必须和 [snapshot] 分开 —— 服务写 .swiftprog 用这个，
+         * 否则 Work Stealing 切出的动态分段在恢复时无法还原终点。
+         */
+        fun snapshotEntries(): List<Segments.ProgEntry> = segCounters.entries
+            .sortedBy { it.key }
+            .map { Segments.ProgEntry(it.key, segEnds[it.key] ?: -1L, it.value.get()) }
 
         /**
          * v2.2 边下边播回写：外部（本地流服务器）在 offset 处写入新拉到的字节。
@@ -701,17 +743,29 @@ class DownloadEngine private constructor() {
             raf.write(buf, 0, len)
         }
 
-        /** 读取 .swiftprog：分段起点 → 已下载字节 */
-        private fun readProg(prog: File): Map<Long, Long> {
+        /**
+         * 读取 .swiftprog：兼容两列旧格式（start bytes）与三列新格式（start end bytes）。
+         * 旧格式的 end 用哨兵标记，由 prepare() 按静态分段补齐。
+         */
+        private fun readProg(prog: File): Map<Long, Segments.ProgEntry> {
             if (!prog.isFile) return emptyMap()
             return try {
-                val out = LinkedHashMap<Long, Long>()
+                val out = LinkedHashMap<Long, Segments.ProgEntry>()
                 for (line in prog.readLines()) {
                     val p = line.trim().split(" ")
-                    if (p.size == 2) {
-                        val start = p[0].toLongOrNull() ?: continue
-                        val bytes = p[1].toLongOrNull() ?: continue
-                        out[start] = bytes
+                    when (p.size) {
+                        2 -> {
+                            val start = p[0].toLongOrNull() ?: continue
+                            val bytes = p[1].toLongOrNull() ?: continue
+                            out[start] = Segments.ProgEntry(
+                                start, Segments.ProgEntry.END_UNKNOWN, bytes)
+                        }
+                        3 -> {
+                            val start = p[0].toLongOrNull() ?: continue
+                            val end = p[1].toLongOrNull() ?: continue
+                            val bytes = p[2].toLongOrNull() ?: continue
+                            out[start] = Segments.ProgEntry(start, end, bytes)
+                        }
                     }
                 }
                 out

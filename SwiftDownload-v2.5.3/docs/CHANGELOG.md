@@ -4,6 +4,80 @@
 
 ---
 
+## v2.6.0 — 并发安全、网络健壮性、引擎能力扩展（2026-11-19）
+
+版本号 `versionCode 11 / versionName 2.6.0`。分四个阶段交付，下载完整性约束全部保留。
+
+### Phase 1 — P0 缺陷与并发安全
+
+- **边下边播**：`StreamServer` 支持 HEAD（返回与 GET 一致的 200/206/416 头但不发 body），
+  416 补齐 `Content-Length` / `Accept-Ranges`；`TaskBacking.fetch/close` 加锁，修复多连接
+  播放器并发 Range 请求导致 `streamPos/conn/stream` 竞态错位。
+- **网络**：抽出 `HttpUtil`，手动跟踪 301/302/303/307/308（含跨协议）最多 5 跳，
+  每跳重放 Range/Referer/Cookie/UA；统一下载与 WebView 的 UA 常量。
+- **引擎**：分段线程池在成功/失败/取消/探测异常各路径均 shutdown，修复核心线程永久泄漏；
+  `Content-Disposition` 改名遇同名文件或 `.part` 占用时自动追加 ` (2)/(3)`；
+  `.part` 写句柄复用并在合并前关闭。
+- **服务/BT**：`start(ctx)` 按 API 26 分流（`startForegroundService`/`startService`），修复 API 24 崩溃；
+  新任务启动时统一挂前台通知；`ListenerOnceGuard` 防止 BT 监听器重复注册；
+  BT 完成统一到 `finishBtTask()` 防重，`onError` 清跟踪表，ticker 不再覆盖 PAUSED/FAILED；
+  `.torrent` 任务补齐 Wi-Fi/时段检查。
+
+### Phase 2 — 网络健壮性与系统适配
+
+- 探测对 HEAD 与退化 GET **都要求 2xx**，403/404 错误页不再被读成文件大小；
+  记录重定向后的 `finalUrl` 供分段直连。
+- 未知 `Content-Length`（Chunked）改为单线程流式下载到 EOF，完成后回填真实长度再走同一套验收。
+- `DownloadTask` 新增 `cookie`/`userAgent`/`exportUri`；DB 升到 **v4**，只做三条
+  `ALTER TABLE ADD COLUMN`，既有任务零改动；浏览器用 `CookieManager` 抓取登录态并全链路透传。
+- 「新建任务」增加可折叠高级选项（文件名 / Referer / Cookie / UA）。
+- 新增并发队列（1–5，默认 3），超限进入 `QUEUED`「等待空闲队列」，任务结束后立即补位；
+  运行中任务若切到移动数据或超出时段，自动挂回排队，条件恢复后自动拉起。
+- Android 10+ 且使用降级目录时，完成后经 `MediaStore.Downloads` 导出到
+  `Download/极速下载/[分类]/`，更新 `save_path`/`export_uri` 并清理私有副本。
+
+### Phase 3 — 核心引擎能力
+
+- **Work Stealing**：率先完成的分段扫描最慢分段，从当前前沿对半切分并派给空闲线程；
+  切分在锁内完成"收缩终点 + 登记新段"，验收/回写语义与新区间一致。
+- **HLS**：支持 AES-128 解密（CBC/PKCS5Padding，显式 IV 或按分片序号）、`EXT-X-BYTERANGE`，
+  4 线程并发拉片 + 单片失败指数退避重试 3 次 + `.hls/` 缓存 + 原子改名防半片 +
+  分片级进度估算与速度采样；fMP4 / SAMPLE-AES 仍明确拒绝。
+- **BT**：支持种子内选文件（未勾选设 IGNORE）、顺序下载开关、已完整落盘视频的「预览」入口。
+
+### Phase 4 — 浏览器、投屏与文件
+
+- 嗅探扩展到 mkv/flv/mov/webm；新增剪贴板智能识别（整段文案提取直链/磁力），
+  回到 App 获焦即弹识别卡片；地址栏常驻「嗅探(N)」角标，可重新查看或批量下载；
+  WebView 随 Activity 生命周期 pause/resume/destroy。
+- DLNA 填充标准 DIDL-Lite 元数据（标题 + `res protocolInfo`），投屏期间持
+  WakeLock/WiFiLock，空闲阈值 2 分钟延长到 10 分钟；弹窗关闭时停止发现线程。
+- 文件页长按与已完成任务卡新增「校验哈希 / 详情」：MD5 / SHA-1 / SHA-256 一次算完，
+  可粘贴官方值比对；浮层统一「← 返回 + 标题」；重命名拒绝 `.` 开头。
+- 新增局域网投递面板（「我的 → 局域网传链接」）：纯 JDK `ServerSocket` 内嵌单页控制台，
+  支持粘贴直链/磁力、上传 `.torrent`、实时查看任务列表。默认关闭、无鉴权，仅可信网络使用。
+
+### Phase 5 — 交叉检查修复
+
+针对四阶段联动处的隐患逐条核查并补测：
+
+- **动态断点丢失**：`.swiftprog` 从两列扩展为三列（起点/终点/字节），兼容旧格式；
+  恢复时按持久化区间还原，不再用静态 `Segments.split` 校验动态起点；`.part` 长度校验
+  只统计实际写过字节的分段。新增"动态切分后续传"端到端测试（验证请求 `bytes=200000-300000`
+  而非从头重下）。
+- **MediaStore 联动**：删除任务同时删 MediaStore 条目；已导出文件的投屏改用
+  `ParcelFileDescriptor` 随机定位零拷贝（不再把 2~4GB 视频复制进 cacheDir）；
+  「投屏/播放/校验」按钮按 `fileAvailable` 判断，打开走 content URI。
+- **HLS 缓存孤儿**：`.hls/` 纳入删除/刷新链接清理路径，递归删除；补多 Key 轮换解析测试。
+- **网卡识别**：`pickLanAddress` 过滤 tun/tap/ppp/dummy 等虚拟网卡，优先 wlan/eth；
+  172.x 只接受 16–31 私有段；补快速开关端口复用测试。
+
+### 测试
+
+`./gradlew testDebugUnitTest`：**139/139 通过**（v2.5.3 的 90 → 101 → 111 → 121 → 132 → 139）。
+
+---
+
 ## v2.5.3 — 代码清理与文档完善（2026-11-17）
 
 **下载行为与 v2.5.2 完全一致**，不含功能变更。版本号 `versionCode 10 / versionName 2.5.3`。
