@@ -210,6 +210,9 @@ class FilesPage(
             opts.add("打开" to { open(f) })
             opts.add("分享" to { share(f) })
             if (MediaTypes.isVideoName(f.name)) opts.add("投屏播放" to { onCast(f.absolutePath) })
+            // v2.7 Stage4.3：文本快速查看 / ZIP 安全解压
+            if (MediaTypes.isTextName(f.name)) opts.add("快速查看" to { showTextViewer(f) })
+            if (MediaTypes.extOf(f.name) == "zip") opts.add("解压到同名文件夹" to { extractZip(f) })
             opts.add("重命名" to { rename(f) })
             opts.add("校验哈希 / 详情" to { com.swift.download.HashDialog.show(ctx, f) })
             opts.add("删除" to {
@@ -239,6 +242,71 @@ class FilesPage(
             } catch (e: Exception) {
                 Ui.toast(context, "无法分享此文件")
             }
+        }
+
+        /** v2.7 Stage4.3：轻量文本查看弹窗（限前 512KB） */
+        private fun showTextViewer(f: File) {
+            val ctx = card.context
+            val text = try {
+                // 手动限长读取（readNBytes 需 API 33，minSdk 24 不可用）
+                val out = java.io.ByteArrayOutputStream()
+                f.inputStream().use { input ->
+                    val buf = ByteArray(8192)
+                    var remaining = MediaTypes.TEXT_PREVIEW_MAX_BYTES
+                    while (remaining > 0) {
+                        val n = input.read(buf, 0, minOf(buf.size, remaining))
+                        if (n <= 0) break
+                        out.write(buf, 0, n)
+                        remaining -= n
+                    }
+                }
+                val content = String(out.toByteArray(), Charsets.UTF_8)
+                val truncated = f.length() > MediaTypes.TEXT_PREVIEW_MAX_BYTES
+                content + if (truncated) "\n\n……（文件较大，仅显示前 ${Format.bytes(MediaTypes.TEXT_PREVIEW_MAX_BYTES.toLong())}）" else ""
+            } catch (e: Exception) {
+                "无法读取文件：${e.message}"
+            }
+            val tv = TextView(ctx).apply {
+                this.text = text
+                textSize = 13f
+                setTextColor(Ui.TXT)
+                setTextIsSelectable(true)
+            }
+            android.app.AlertDialog.Builder(ctx)
+                .setTitle(f.name)
+                .setView(Ui.verticalScroll(ctx, tv))
+                .setPositiveButton("关闭", null)
+                .show()
+        }
+
+        /** v2.7 Stage4.3：后台安全解压到同名文件夹，完成提示并刷新 */
+        private fun extractZip(f: File) {
+            val ctx = card.context
+            val dest = File(f.parentFile, f.nameWithoutExtension)
+            if (dest.exists()) {
+                android.app.AlertDialog.Builder(ctx)
+                    .setMessage("已存在同名文件夹「${dest.name}」，解压会覆盖同名文件。继续？")
+                    .setPositiveButton("继续") { _, _ -> doExtract(ctx, f, dest) }
+                    .setNegativeButton("取消", null)
+                    .show()
+            } else {
+                doExtract(ctx, f, dest)
+            }
+        }
+
+        private fun doExtract(ctx: android.content.Context, f: File, dest: File) {
+            Ui.toast(ctx, "正在解压 ${f.name}…")
+            Thread {
+                val result = ZipExtract.extract(f, dest)
+                post {
+                    if (result.failed != null) {
+                        Ui.toast(ctx, "解压失败：${result.failed}")
+                    } else {
+                        Ui.toast(ctx, "解压完成：${result.files} 个文件")
+                        refresh()
+                    }
+                }
+            }.apply { isDaemon = true }.start()
         }
 
         private fun rename(f: File) {

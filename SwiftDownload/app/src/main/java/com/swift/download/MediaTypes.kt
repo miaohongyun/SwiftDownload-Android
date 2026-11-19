@@ -11,8 +11,16 @@ object MediaTypes {
     )
     val AUDIO_EXTS = setOf("mp3", "flac", "wav", "aac", "m4a", "ogg", "wma", "ape")
 
+    /** v2.7 Stage4.3：可内置轻量预览的纯文本/日志/字幕类扩展名 */
+    val TEXT_EXTS = setOf("txt", "log", "json", "srt", "ass")
+
+    /** v2.7 Stage4.3：文本预览最大读取字节数（512KB），防大文件卡顿 */
+    const val TEXT_PREVIEW_MAX_BYTES = 512 * 1024
+
     fun extOf(name: String): String =
         name.substringAfterLast('.', "").lowercase()
+
+    fun isTextName(name: String): Boolean = extOf(name) in TEXT_EXTS
 
     fun isVideoName(name: String): Boolean = extOf(name) in VIDEO_EXTS
 

@@ -56,6 +56,10 @@ object Ui {
             setLineSpacing(dp(ctx, 2f).toFloat(), 1f)
         }
 
+    /** v2.7 Stage4.1：等宽数字（tnum），消除每 500ms 刷新时数字宽度变化导致的抖动 */
+    fun numericText(ctx: Context, s: CharSequence, size: Float, color: Int, bold: Boolean = false): TextView =
+        text(ctx, s, size, color, bold).apply { fontFeatureSettings = "tnum" }
+
     fun singleLineEt(ctx: Context, hint: String): EditText = EditText(ctx).apply {
         this.hint = hint
         setSingleLine()

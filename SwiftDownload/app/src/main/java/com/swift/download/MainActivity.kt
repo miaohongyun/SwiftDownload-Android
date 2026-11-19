@@ -15,8 +15,12 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.app.AppCompatDelegate
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import com.swift.download.browser.BookmarkManagerPage
 import com.swift.download.browser.BrowserPage
 import com.swift.download.dlna.DlnaPicker
@@ -51,6 +55,13 @@ class MainActivity : AppCompatActivity() {
     private var binder: DownloadService.DownloadBinder? = null
     private var overlay: FrameLayout? = null
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+
+    /** v2.7 Stage4.4：备份导出暂存 JSON（CREATE_DOCUMENT 回调时写入） */
+    private var pendingBackupJson: String? = null
+    companion object {
+        private const val REQ_EXPORT_BACKUP = 2401
+        private const val REQ_IMPORT_BACKUP = 2402
+    }
 
     private val serviceConn = object : android.content.ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: android.os.IBinder?) {
@@ -94,6 +105,11 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // v2.7 Stage4.1：锁定浅色主题，避免系统深色模式下 AlertDialog/系统控件
+        // 与硬编码浅色卡片产生文字看不清的反差。
+        AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_NO)
+        // v2.7 Stage4.1：targetSdk 36 默认 Edge-to-Edge，关闭 decor 自动贴合，改由下面手动施加安全边距
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         ensureDirs()
         requestNotifPermission()
 
@@ -102,6 +118,20 @@ class MainActivity : AppCompatActivity() {
         root.addView(pageHost, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         root.addView(buildBottomNav(), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         setContentView(root)
+        // v2.7 Stage4.1：把 systemBars + ime 安全区作为根布局 padding，
+        // 顶栏不再撞状态栏、底栏不被手势条遮挡、弹键盘时输入框不被盖住。
+        ViewCompat.setOnApplyWindowInsetsListener(root) { v, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            v.setPadding(
+                bars.left,
+                bars.top,
+                bars.right,
+                maxOf(bars.bottom, ime.bottom)
+            )
+            insets
+        }
+        ViewCompat.requestApplyInsets(root)
 
         browserPage = BrowserPage(
             this,
@@ -403,6 +433,7 @@ class MainActivity : AppCompatActivity() {
             },
             "磁力源管理" to { showOverlay(MagnetSourceManagerPage(ctx), "磁力源管理") },
             "下载设置" to { showSettingsFromMine() },
+            "备份与恢复" to { showBackupMenu() },
             "局域网传链接" to { toggleLanRemote() },
             "关于" to { showAbout() }
         )
@@ -468,6 +499,103 @@ class MainActivity : AppCompatActivity() {
         ), "下载设置")
     }
 
+    /* ---------------- v2.7 Stage4.4：备份与恢复 ---------------- */
+
+    private fun showBackupMenu() {
+        android.app.AlertDialog.Builder(this)
+            .setTitle("备份与恢复")
+            .setMessage("导出：书签 / 磁力源 / 广告规则 / 全部下载设置 → 单个 JSON 文件。\n导入：从备份 JSON 恢复以上配置。")
+            .setPositiveButton("导出备份") { _, _ -> exportBackup() }
+            .setNegativeButton("导入恢复") { _, _ -> importBackup() }
+            .setNeutralButton("取消", null)
+            .show()
+    }
+
+    /** 导出：先写入 files 临时文件，再用 ACTION_CREATE_DOCUMENT 让用户选择保存位置 */
+    private fun exportBackup() {
+        val data = com.swift.download.settings.BackupManager.get(this).collect()
+        val json = com.swift.download.settings.BackupCodec.toJson(data)
+        pendingBackupJson = json
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/json"
+            putExtra(Intent.EXTRA_TITLE,
+                com.swift.download.settings.BackupManager.backupFileName(data.timestamp))
+        }
+        try {
+            startActivityForResult(intent, REQ_EXPORT_BACKUP)
+        } catch (e: Exception) {
+            Ui.toast(this, "无法打开系统文件选择器")
+        }
+    }
+
+    /** 导入：ACTION_OPEN_DOCUMENT 选择备份 JSON */
+    private fun importBackup() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+        }
+        try {
+            startActivityForResult(intent, REQ_IMPORT_BACKUP)
+        } catch (e: Exception) {
+            Ui.toast(this, "无法打开系统文件选择器")
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (resultCode != android.app.Activity.RESULT_OK || data?.data == null) return
+        val uri = data.data ?: return
+        when (requestCode) {
+            REQ_EXPORT_BACKUP -> {
+                val json = pendingBackupJson
+                pendingBackupJson = null
+                if (json == null) return
+                try {
+                    contentResolver.openOutputStream(uri)?.use { out ->
+                        out.write(json.toByteArray(Charsets.UTF_8))
+                    }
+                    Ui.toast(this, "备份已导出")
+                } catch (e: Exception) {
+                    Ui.toast(this, "导出失败：${e.message}")
+                }
+            }
+            REQ_IMPORT_BACKUP -> {
+                val text = try {
+                    contentResolver.openInputStream(uri)?.use { it.bufferedReader(Charsets.UTF_8).readText() }
+                } catch (e: Exception) { null }
+                if (text.isNullOrBlank()) {
+                    Ui.toast(this, "无法读取备份文件")
+                    return
+                }
+                val parsed = try {
+                    com.swift.download.settings.BackupCodec.fromJson(text)
+                } catch (e: com.swift.download.settings.BackupCodec.IncompatibleVersion) {
+                    Ui.toast(this, "备份版本过新，暂不支持")
+                    return
+                } catch (e: Exception) {
+                    Ui.toast(this, "备份文件格式错误")
+                    return
+                }
+                // 二次确认覆盖/合并
+                android.app.AlertDialog.Builder(this)
+                    .setTitle("导入备份")
+                    .setMessage("将恢复 ${parsed.sites.size} 个书签、${parsed.magnetOverrides.size} 个磁力源、${parsed.settings.size} 项设置。\n\n选择「覆盖」会清除现有自定义书签后导入；「合并」保留现有项。")
+                    .setPositiveButton("合并") { _, _ -> applyRestore(parsed, false) }
+                    .setNegativeButton("覆盖") { _, _ -> applyRestore(parsed, true) }
+                    .setNeutralButton("取消", null)
+                    .show()
+            }
+        }
+    }
+
+    private fun applyRestore(data: com.swift.download.settings.BackupCodec.BackupData, overwrite: Boolean) {
+        val summary = com.swift.download.settings.BackupManager.get(this).restore(data, overwrite)
+        binder?.applyBtNetworkSettings()
+        browserPage.refreshBookmarks()
+        Ui.toast(this, "已恢复：${summary.sites} 书签 / ${summary.magnets} 磁力源 / ${summary.settings} 设置")
+    }
+
     private fun showAbout() {
         android.app.AlertDialog.Builder(this)
             .setTitle("极速下载")
@@ -519,7 +647,15 @@ class MainActivity : AppCompatActivity() {
             setBackgroundColor(Ui.BG)
             addView(column, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         }
+        // v2.7 Stage4.1：浮层同样施加 systemBars + ime 安全边距
+        ViewCompat.setOnApplyWindowInsetsListener(fl) { v, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            v.setPadding(bars.left, bars.top, bars.right, maxOf(bars.bottom, ime.bottom))
+            insets
+        }
         root.addView(fl, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        ViewCompat.requestApplyInsets(fl)
         overlay = fl
     }
 

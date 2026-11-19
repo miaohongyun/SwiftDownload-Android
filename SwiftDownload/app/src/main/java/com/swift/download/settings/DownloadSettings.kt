@@ -146,6 +146,43 @@ class DownloadSettings private constructor(ctx: Context) {
     fun setTaskLimitBps(taskId: Long, bps: Long) =
         prefs.edit().putLong("$KEY_TASK_LIMIT$taskId", bps.coerceAtLeast(0)).apply()
 
+    /* ---------- v2.7 Stage4.4：备份导出/导入 ---------- */
+
+    /**
+     * 导出可备份的设置项。值统一转为字符串并带类型前缀（b/i/l/s），
+     * 导入时按前缀还原类型（见 [applyBackupMap]）。
+     */
+    fun exportBackupMap(): Map<String, String> {
+        val out = LinkedHashMap<String, String>()
+        for (k in BACKUP_KEYS) {
+            if (!prefs.contains(k)) continue
+            val v = prefs.all[k] ?: continue
+            out[k] = when (v) {
+                is Boolean -> "b:$v"
+                is Int -> "i:$v"
+                is Long -> "l:$v"
+                is String -> "s:$v"
+                else -> null
+            } ?: continue
+        }
+        return out
+    }
+
+    /** 从备份映射还原设置（只认白名单键与类型前缀，忽略未知项） */
+    fun applyBackupMap(map: Map<String, String>) {
+        val ed = prefs.edit()
+        for ((k, raw) in map) {
+            if (k !in BACKUP_KEYS) continue
+            when {
+                raw.startsWith("b:") -> raw.substring(2).toBooleanStrictOrNull()?.let { ed.putBoolean(k, it) }
+                raw.startsWith("i:") -> raw.substring(2).toIntOrNull()?.let { ed.putInt(k, it) }
+                raw.startsWith("l:") -> raw.substring(2).toLongOrNull()?.let { ed.putLong(k, it) }
+                raw.startsWith("s:") -> ed.putString(k, raw.substring(2))
+            }
+        }
+        ed.apply()
+    }
+
     /** 安装进程级代理选择器，覆盖 HttpURLConnection（HTTP 下载 / 磁力抓取 / m3u8 分段） */
     fun installProxySelector() {
         val delegate = ProxySelector.getDefault()
@@ -185,6 +222,15 @@ class DownloadSettings private constructor(ctx: Context) {
         private const val KEY_AD_BLOCK = "ad_block_enabled"
         private const val KEY_AD_BLOCK_RULES = "ad_block_rules"
         private const val KEY_TASK_LIMIT = "task_limit_"
+
+        /** 参与备份的设置键白名单（不含单任务限速这类动态键） */
+        private val BACKUP_KEYS = setOf(
+            KEY_GLOBAL_LIMIT, KEY_WIFI_ONLY, KEY_SCHEDULE, KEY_SCHEDULE_START, KEY_SCHEDULE_END,
+            KEY_CATEGORY, KEY_AUTO_REMUX, KEY_M3U8, KEY_MAX_CONCURRENT, KEY_EXPORT_PUBLIC,
+            KEY_PROXY_ON, KEY_PROXY_HOST, KEY_PROXY_PORT, KEY_PROXY_TYPE, KEY_PROXY_BT,
+            KEY_BT_SEEDING, KEY_BT_UPLOAD, KEY_BT_TRACKER, KEY_AUTO_RETRY,
+            KEY_AD_BLOCK, KEY_AD_BLOCK_RULES
+        )
 
         @Volatile private var inst: DownloadSettings? = null
         fun get(ctx: Context): DownloadSettings =

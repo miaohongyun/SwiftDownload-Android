@@ -92,6 +92,10 @@ class TransfersPage(
     private val adapter = TaskAdapter()
     private val toolbar = FlowLayout(context)
 
+    /** v2.7 Stage4.2：状态筛选 */
+    private var currentFilter = TaskFilters.Filter.ALL
+    private val filterPills = ArrayList<TextView>()
+
     private val speedHints = HashMap<Long, Long>()
 
     /** v2.5：单任务限速值缓存（供弹窗回显与按钮标记） */
@@ -106,7 +110,7 @@ class TransfersPage(
         }
         val title = Ui.text(context, "传输", 20f, Ui.TXT, bold = true)
         header.addView(title, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        tvTotal = Ui.text(context, "", 13f, Ui.TXT_SUB)
+        tvTotal = Ui.numericText(context, "", 13f, Ui.TXT_SUB)
         header.addView(tvTotal)
         val settings = TextView(context).apply {
             text = "设置"; textSize = 13f; setTextColor(Ui.BLUE)
@@ -128,6 +132,20 @@ class TransfersPage(
         toolbar.addFlow(Ui.pillBtn(context, "全部继续", Ui.BLUE, filled = true) { controller.resumeAll() })
         toolbar.addFlow(Ui.pillBtn(context, "清除完成", Ui.TXT_SUB) { controller.clearCompleted() })
         root.addView(toolbar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        // v2.7 Stage4.2：状态筛选胶囊栏（带数量角标）
+        val filterBar = FlowLayout(context)
+        filterBar.setPadding(Ui.dp(context, 14f), Ui.dp(context, 2f), Ui.dp(context, 14f), Ui.dp(context, 4f))
+        for (f in TaskFilters.Filter.entries) {
+            val pill = Ui.pillBtn(context, labelOf(f), Ui.BLUE, filled = (f == currentFilter)) {
+                currentFilter = f
+                refreshFilterPills()
+                onTasks(lastTasks)
+            }
+            filterPills.add(pill)
+            filterBar.addFlow(pill)
+        }
+        root.addView(filterBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         val rv = Ui.recyclerView(context)
         rv.adapter = adapter
@@ -176,6 +194,39 @@ class TransfersPage(
         for (id in serverSpeeds.keys.toList()) if (id !in liveIds) serverSpeeds.remove(id)
     }
 
+    /** v2.7 Stage4.2：筛选胶囊文案（带数量角标） */
+    private fun labelOf(f: TaskFilters.Filter): String {
+        val c = TaskFilters.counts(lastTasks)
+        val n = when (f) {
+            TaskFilters.Filter.ALL -> c.all
+            TaskFilters.Filter.ACTIVE -> c.active
+            TaskFilters.Filter.COMPLETED -> c.completed
+            TaskFilters.Filter.FAILED -> c.failed
+        }
+        val name = when (f) {
+            TaskFilters.Filter.ALL -> "全部"
+            TaskFilters.Filter.ACTIVE -> "进行中"
+            TaskFilters.Filter.COMPLETED -> "已完成"
+            TaskFilters.Filter.FAILED -> "失败"
+        }
+        return "$name($n)"
+    }
+
+    private fun refreshFilterPills() {
+        for ((i, pill) in filterPills.withIndex()) {
+            val f = TaskFilters.Filter.entries[i]
+            pill.text = labelOf(f)
+            // 选中态用实心，未选中描边
+            val color = Ui.BLUE
+            pill.background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(if (f == currentFilter) color else 0x00000000)
+                setStroke(Ui.dp(context, 1f), color)
+                cornerRadius = Ui.dp(context, 16f).toFloat()
+            }
+            pill.setTextColor(if (f == currentFilter) 0xFFFFFFFF.toInt() else color)
+        }
+    }
+
     fun onTasks(tasks: List<DownloadTask>) {
         computeSpeeds(tasks)
         val running = tasks.filter { it.status == DownloadTask.Status.RUNNING }
@@ -191,11 +242,14 @@ class TransfersPage(
             tvFreeSpace.visibility = if (free.isEmpty()) View.GONE else View.VISIBLE
         }
         toolbar.visibility = if (tasks.isEmpty()) View.GONE else View.VISIBLE
+        refreshFilterPills()
+        // v2.7 Stage4.2：按当前筛选条件展示任务（剪贴板卡/新建卡始终在最上方保留）
+        val shown = TaskFilters.filter(tasks, currentFilter)
         adapter.submit(buildList {
             adapter.pendingClipUrl?.let { add(Decor.ClipCard(it)) }
             add(Decor.NewTaskCard)
-            if (tasks.isEmpty()) add(Decor.EmptyState)
-            for (t in tasks) add(Decor.DecorTask(t))
+            if (shown.isEmpty()) add(Decor.EmptyState)
+            for (t in shown) add(Decor.DecorTask(t))
         })
     }
 
@@ -636,14 +690,15 @@ class TransfersPage(
                     if (hint.isNotEmpty()) append(" · ").append(hint)
                 }
             }
-            card.addView(Ui.text(ctx, statusText, 13f, statusColor(st)),
+            // v2.7 Stage4.1：速度/进度等动态数字用等宽字体，避免刷新时宽度跳动
+            card.addView(Ui.numericText(ctx, statusText, 13f, statusColor(st)),
                 LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
                     .apply { topMargin = Ui.dp(ctx, 6f) })
 
             // 体积行（v2.2：带百分比）
             val pct = if (t.totalBytes > 0) " · %.1f%%".format(t.downloadedBytes * 100.0 / t.totalBytes) else ""
             val vol = if (t.totalBytes >= 0) "${Format.bytes(t.downloadedBytes)} / ${Format.bytes(t.totalBytes)}$pct" else Format.bytes(t.downloadedBytes)
-            card.addView(Ui.text(ctx, vol, 12f, Ui.TXT_SUB),
+            card.addView(Ui.numericText(ctx, vol, 12f, Ui.TXT_SUB),
                 LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
                     .apply { topMargin = Ui.dp(ctx, 3f) })
 
