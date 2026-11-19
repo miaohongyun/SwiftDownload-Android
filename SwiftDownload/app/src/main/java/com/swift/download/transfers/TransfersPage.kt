@@ -95,6 +95,8 @@ class TransfersPage(
     private lateinit var tvFreeSpace: TextView
     private val adapter = TaskAdapter()
     private val toolbar = FlowLayout(context)
+    /** v2.8 交互优化：空任务时隐藏筛选栏，减少空状态杂乱 */
+    private val filterBar = FlowLayout(context)
 
     /** v2.7 Stage4.2：状态筛选 */
     private var currentFilter = TaskFilters.Filter.ALL
@@ -133,6 +135,20 @@ class TransfersPage(
         header.addView(title, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         tvTotal = Ui.numericText(context, "", 13f, Ui.TXT_SUB)
         header.addView(tvTotal)
+        // v2.8 交互优化：醒目的「＋ 新建」主入口，用户不必滚到列表底部找新建卡片
+        val addBtn = TextView(context).apply {
+            text = "＋ 新建"; textSize = 13f; setTextColor(0xFFFFFFFF.toInt())
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            setPadding(Ui.dp(context, 12f), Ui.dp(context, 6f), Ui.dp(context, 12f), Ui.dp(context, 6f))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(Ui.BLUE); cornerRadius = Ui.dp(context, 16f).toFloat()
+            }
+            Ui.pressable(this)
+            setOnClickListener { showNewTaskDialog() }
+        }
+        header.addView(addBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginStart = Ui.dp(context, 8f) })
         val settings = TextView(context).apply {
             text = "设置"; textSize = 13f; setTextColor(Ui.BLUE)
             setPadding(Ui.dp(context, 10f), Ui.dp(context, 4f), Ui.dp(context, 2f), Ui.dp(context, 4f))
@@ -155,7 +171,6 @@ class TransfersPage(
         root.addView(toolbar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         // v2.7 Stage4.2：状态筛选胶囊栏（带数量角标）
-        val filterBar = FlowLayout(context)
         filterBar.setPadding(Ui.dp(context, 14f), Ui.dp(context, 2f), Ui.dp(context, 14f), Ui.dp(context, 4f))
         for (f in TaskFilters.Filter.entries) {
             val pill = Ui.pillBtn(context, labelOf(f), Ui.BLUE, filled = (f == currentFilter)) {
@@ -259,6 +274,7 @@ class TransfersPage(
             tvFreeSpace.visibility = if (free.isEmpty()) View.GONE else View.VISIBLE
         }
         toolbar.visibility = if (tasks.isEmpty()) View.GONE else View.VISIBLE
+        filterBar.visibility = if (tasks.isEmpty()) View.GONE else View.VISIBLE
         refreshFilterPills()
         // v2.7 Stage4.2：按当前筛选条件展示任务（剪贴板卡/新建卡始终在最上方保留）
         val shown = TaskFilters.filter(tasks, currentFilter)
