@@ -76,6 +76,15 @@ class DownloadSettings private constructor(ctx: Context) {
         get() = prefs.getInt(KEY_PROXY_PORT, 7890)
         set(value) = prefs.edit().putInt(KEY_PROXY_PORT, value.coerceIn(1, 65535)).apply()
 
+    /** v2.7 Stage1.2：网络瞬断自动重试次数（0..5，默认 3；0 = 关闭） */
+    var autoRetryCount: Int
+        get() = com.swift.download.settings.RetryPolicy.normalizeMax(
+            prefs.getInt(KEY_AUTO_RETRY, com.swift.download.settings.RetryPolicy.DEFAULT_MAX_RETRIES)
+        )
+        set(value) = prefs.edit().putInt(
+            KEY_AUTO_RETRY, com.swift.download.settings.RetryPolicy.normalizeMax(value)
+        ).apply()
+
     fun taskLimitBps(taskId: Long): Long = prefs.getLong("$KEY_TASK_LIMIT$taskId", 0L)
     fun setTaskLimitBps(taskId: Long, bps: Long) =
         prefs.edit().putLong("$KEY_TASK_LIMIT$taskId", bps.coerceAtLeast(0)).apply()
@@ -109,6 +118,7 @@ class DownloadSettings private constructor(ctx: Context) {
         private const val KEY_PROXY_ON = "proxy_enabled"
         private const val KEY_PROXY_HOST = "proxy_host"
         private const val KEY_PROXY_PORT = "proxy_port"
+        private const val KEY_AUTO_RETRY = "auto_retry_count"
         private const val KEY_TASK_LIMIT = "task_limit_"
 
         @Volatile private var inst: DownloadSettings? = null

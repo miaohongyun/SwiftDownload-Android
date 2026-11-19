@@ -34,6 +34,7 @@ import com.swift.download.settings.RateLimiter
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -110,6 +111,16 @@ class DownloadService : Service() {
 
         /** 链接刷新：替换失效直链并从头重下 */
         fun refreshLink(id: Long, newUrl: String): Boolean = this@DownloadService.refreshLink(id, newUrl)
+        /** v2.7 Stage1.1：刷新链接时是否保留断点（异步探测后回调结果） */
+        fun refreshLinkKeepProgress(
+            id: Long, newUrl: String, keep: Boolean, cb: (Boolean, String) -> Unit
+        ) = this@DownloadService.refreshLinkKeepProgress(id, newUrl, keep, cb)
+
+        /** v2.7 Stage1.2：网络重连提示文案；空串表示未在重试 */
+        fun retryHint(id: Long): String = this@DownloadService.retryHints[id].orEmpty()
+        /** v2.7 Stage1.3：下载目录剩余空间文案 */
+        fun freeSpaceLabel(): String =
+            com.swift.download.StorageRoots.freeSpaceLabel(com.swift.download.StorageRoots.downloadRoot(this@DownloadService))
 
         fun restartTask(id: Long): Long? = this@DownloadService.restartTask(id)
 
@@ -137,6 +148,14 @@ class DownloadService : Service() {
             return com.swift.download.bt.TorrentEngine.get().readyVideoPath(hash)
         }
 
+        /* v2.7 Stage1.4：任务详情数据 */
+        fun httpSegmentCount(id: Long): Int = httpJobs[id]?.snapshot()?.size ?: -1
+        fun btSeedsPeers(id: Long): Pair<Int, Int>? {
+            val hash = btHashes[id] ?: return null
+            val p = com.swift.download.bt.TorrentEngine.get().progressOf(hash) ?: return null
+            return p.seeds to p.peers
+        }
+
         /* v2.6.0：局域网远程投递面板 */
         fun startLanRemote(): String? = this@DownloadService.startLanRemote()
         fun stopLanRemote() = this@DownloadService.stopLanRemote()
@@ -158,6 +177,8 @@ class DownloadService : Service() {
     private val settings by lazy { DownloadSettings.get(this) }
     private val rateLimiter = RateLimiter()
     private val m3u8Jobs = ConcurrentHashMap<Long, M3u8Job>()
+    /** v2.7 Stage1.2：HTTP 任务瞬断重试提示（如「网络重连 1/3」），不入库，仅 UI 展示 */
+    private val retryHints = ConcurrentHashMap<Long, String>()
     /** m3u8 进度通知/落库节流时间戳（分片回调过于密集） */
     private val m3u8TickAt = ConcurrentHashMap<Long, Long>()
     private val connectivity by lazy { getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager }
@@ -908,9 +929,23 @@ class DownloadService : Service() {
         val t = tasks[id] ?: return
         // 已有活跃 Job：先停掉，避免同一任务出现两个执行体（重复下载同一文件）
         httpJobs[id]?.cancel()
-        val job = DownloadEngine.get().newJob(t, engineListener(id)) { n ->
-            rateLimiter.acquire(n, effectiveLimit(id))
-        }
+        val job = DownloadEngine.get().newJob(
+            t,
+            engineListener(id),
+            { n -> rateLimiter.acquire(n, effectiveLimit(id)) },
+            // v2.7 Stage1.3：注入真实剩余空间，probe 后做前置校验
+            availableBytes = {
+                com.swift.download.StorageRoots.availableBytes(
+                    File(t.savePath).parentFile ?: com.swift.download.StorageRoots.downloadRoot(this)
+                )
+            },
+            // v2.7 Stage1.2：注入自动重试次数与状态提示
+            maxRetries = settings.autoRetryCount,
+            onRetry = { attempt, max ->
+                retryHints[id] = "网络重连 $attempt/$max"
+                notifyUi()
+            }
+        )
         httpJobs[id] = job
         job.start()
     }
@@ -920,6 +955,8 @@ class DownloadService : Service() {
             // ticker 统一回写，这里不处理（v1.0 即为轮询模型）
         }
         override fun onStatus(task: DownloadTask) {
+            // v2.7 Stage1.2：进入稳定 RUNNING 态即清掉重连提示（probe 完成后这里会再回调一次）
+            if (task.status == DownloadTask.Status.RUNNING) retryHints.remove(id)
             // probe 得到的 totalBytes / fileName 必须落库，否则 resume() 里的 reload()
             // 会把它们覆盖回 -1，导致边下边播与重启恢复再次拿到未知大小
             val current = tasks[id]
@@ -928,6 +965,10 @@ class DownloadService : Service() {
             ) {
                 db.updateMeta(id, task.fileName, task.totalBytes)
                 db.updateSavePath(id, task.savePath)
+            }
+            // v2.7 Stage1.4：probe 得到的最终重定向地址单独落库，供任务详情展示
+            if (task.finalUrl.isNotBlank() && current?.finalUrl != task.finalUrl) {
+                db.updateFinalUrl(id, task.finalUrl)
             }
             // 进入运行态即清除"等待 Wi-Fi / 等待时段"这类排队原因，避免 UI 显示为失败
             val err = if (task.status == DownloadTask.Status.RUNNING ||
@@ -938,6 +979,7 @@ class DownloadService : Service() {
             notifyUi()
         }
         override fun onFinished(task: DownloadTask) {
+            retryHints.remove(id)
             db.updateProgress(id, task.downloadedBytes, DownloadTask.Status.COMPLETED, "")
             tasks[id] = task.copy(status = DownloadTask.Status.COMPLETED)
             exportToPublicDownloads(id, task)
@@ -948,6 +990,7 @@ class DownloadService : Service() {
             Log.i(TAG, "finished ${task.fileName}")
         }
         override fun onError(task: DownloadTask, error: String) {
+            retryHints.remove(id)
             db.updateProgress(id, task.downloadedBytes, DownloadTask.Status.FAILED, error)
             tasks[id] = task.copy(status = DownloadTask.Status.FAILED, error = error)
             httpJobs.remove(id)
@@ -958,6 +1001,7 @@ class DownloadService : Service() {
 
     fun pause(id: Long) {
         val t = tasks[id] ?: return
+        retryHints.remove(id)
         if (t.isM3u8) {
             m3u8Jobs[id]?.cancel()
             m3u8Jobs.remove(id)
@@ -1060,6 +1104,74 @@ class DownloadService : Service() {
         }
         notifyUi()
         return true
+    }
+
+    /**
+     * v2.7 Stage1.1：刷新链接并尽可能保留断点。
+     * 在 IO 线程探测新链接，只有大小完全一致且支持 Range 才保留 .part/.swiftprog；
+     * 否则回退到普通清空重下（refreshLink）。结果回主线程回调 UI。
+     */
+    fun refreshLinkKeepProgress(
+        id: Long, newUrl: String, keep: Boolean, cb: (Boolean, String) -> Unit
+    ) {
+        val url = DownloadRules.normalizeRefreshedUrl(newUrl)
+        if (url == null) {
+            cb(false, "请输入 http/https 开头的直链")
+            return
+        }
+        val t = tasks[id]
+        if (t == null) {
+            cb(false, "任务不存在")
+            return
+        }
+        if (!keep) {
+            val ok = refreshLink(id, url)
+            cb(ok, if (ok) "已替换链接并从头下载" else "刷新失败")
+            return
+        }
+        scope.launch {
+            try {
+                if (!t.isHttp) {
+                    val ok = refreshLink(id, url)
+                    withContext(Dispatchers.Main) { cb(ok, "非 HTTP 任务无法保留断点，已从头重下") }
+                    return@launch
+                }
+                val probe = DownloadEngine.get().probe(url, t.referer, t.cookie, t.userAgent)
+                val finalUrl = probe.finalUrl.ifBlank { url }
+                val newKindIsHttp = !settings.m3u8Enabled ||
+                    !com.swift.download.player.M3u8.looksLikeM3u8(finalUrl)
+                val decision = com.swift.download.settings.RefreshRules.decide(
+                    keepRequested = true,
+                    oldTotalBytes = t.totalBytes,
+                    newTotalBytes = probe.totalBytes,
+                    acceptRanges = probe.acceptRanges,
+                    newKindIsHttp = newKindIsHttp
+                )
+                if (decision.keep) {
+                    // 停掉旧执行体，但保留 .part / .swiftprog / 进度
+                    if (streamSession?.taskId == id) endStream(resume = false)
+                    httpJobs[id]?.cancel(); httpJobs.remove(id)
+                    retryHints.remove(id)
+                    tasks.remove(id)
+                    db.updateUrlKeepProgress(id, url, t.referer, t.cookie)
+                    reload()
+                    startHttp(id)
+                    withContext(Dispatchers.Main) { cb(true, "已保留进度，从断点继续") }
+                } else {
+                    // 条件不满足：提示原因并回退为清空重下
+                    val ok = refreshLink(id, url)
+                    withContext(Dispatchers.Main) {
+                        cb(ok, "无法保留进度（${decision.reason}），已从头重下")
+                    }
+                }
+            } catch (e: Exception) {
+                // 探测失败（链接仍失效）：回退清空重下并提示
+                val ok = refreshLink(id, url)
+                withContext(Dispatchers.Main) {
+                    cb(ok, "新链接探测失败（${e.message ?: "未知错误"}），已从头重下")
+                }
+            }
+        }
     }
 
     fun setTaskLimitBps(id: Long, bps: Long) = settings.setTaskLimitBps(id, bps)
@@ -1312,6 +1424,20 @@ class DownloadService : Service() {
         override fun onMetadata(hash: String, name: String, totalBytes: Long, files: Int) {
             val id = btHashes.entries.firstOrNull { it.value == hash }?.key ?: return
             val t = tasks[id] ?: return
+            // v2.7 Stage1.3：BT 元数据到手后前置校验空间，避免下到 99% 才发现放不下
+            val free = com.swift.download.StorageRoots.availableBytes(
+                File(t.savePath).parentFile
+                    ?: com.swift.download.StorageRoots.downloadRoot(this@DownloadService)
+            )
+            if (!com.swift.download.StorageGuard.hasEnough(free, totalBytes)) {
+                val msg = com.swift.download.StorageGuard.insufficientMessage(free, totalBytes)
+                Log.w(TAG, "BT 空间不足：$msg")
+                TorrentEngine.get().find(hash)?.pause()
+                btHashes.remove(id)
+                db.updateStatus(id, DownloadTask.Status.FAILED, msg)
+                reload(); notifyUi(); onSlotFreed()
+                return
+            }
             val upd = applyBtMeta(id, t, name, totalBytes)
             if (upd !== t) {
                 tasks[id] = upd.copy(status = DownloadTask.Status.RUNNING)

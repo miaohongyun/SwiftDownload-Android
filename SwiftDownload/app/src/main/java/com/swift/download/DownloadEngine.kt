@@ -1,6 +1,7 @@
 package com.swift.download
 
 import android.util.Log
+import com.swift.download.settings.RetryPolicy
 import java.io.File
 import java.io.IOException
 import java.io.RandomAccessFile
@@ -153,7 +154,13 @@ class DownloadEngine private constructor() {
     inner class DownloadJob(
         val task: DownloadTask,
         private val listener: EngineListener,
-        private val throttle: (Int) -> Unit = {}
+        private val throttle: (Int) -> Unit = {},
+        /** v2.7 Stage1.3：注入的剩余空间读数；默认 -1（跳过校验，保持纯 JVM 测试无 Android 依赖） */
+        private val availableBytes: () -> Long = { -1L },
+        /** v2.7 Stage1.2：最多自动重试次数；默认 0（不重试，保持既有行为，服务层按设置注入） */
+        private val maxRetries: Int = 0,
+        /** v2.7 Stage1.2：重试等待回调（attempt 1-based），用于 UI 展示「网络重连 1/3…」 */
+        private val onRetry: (attempt: Int, max: Int) -> Unit = { _, _ -> }
     ) {
         private val cancelled = AtomicBoolean(false)
         private val failed = AtomicBoolean(false)
@@ -308,9 +315,20 @@ class DownloadEngine private constructor() {
                 } else task.savePath
                 val t = task.copy(
                     url = sourceUrl, fileName = finalName,
-                    totalBytes = probe.totalBytes, savePath = savePath
+                    totalBytes = probe.totalBytes, savePath = savePath,
+                    // v2.7 Stage1.4：记录重定向后的最终地址供任务详情展示
+                    finalUrl = if (probe.finalUrl.isNotBlank()) probe.finalUrl else sourceUrl
                 )
 
+                // v2.7 Stage1.3：空间前置校验。用"还需下载量"而非总大小判断，
+                // 续传时只剩一小段就不该因总大小大于剩余空间而误拦。
+                val remainingNeed = if (hasResume) {
+                    probe.totalBytes - (progEntries.values.sumOf { it.bytes.coerceAtLeast(0L) })
+                } else probe.totalBytes
+                val freeBytes = availableBytes()
+                if (!StorageGuard.hasEnough(freeBytes, remainingNeed)) {
+                    throw IOException(StorageGuard.insufficientMessage(freeBytes, remainingNeed))
+                }
                 if (!hasResume) {
                     // 新任务：清掉同名残留半成品，避免旧数据混入新文件
                     clearStaleParts(task.savePath, t.savePath)
@@ -421,6 +439,10 @@ class DownloadEngine private constructor() {
         }
 
         private fun segment(t: DownloadTask, start: Long, end: Long, counter: AtomicLong) {
+            // v2.7 Stage1.2：可恢复瞬断的指数退避重试。每次重试都从 counter 重新读取
+            // resumeFrom（已落盘的字节由 counter 跟踪），因此续传点始终正确，不会重复/错位。
+            var attempt = 0
+            while (!cancelled.get()) {
             var conn: HttpURLConnection? = null
             var raf: RandomAccessFile? = null
             try {
@@ -530,21 +552,40 @@ class DownloadEngine private constructor() {
                 // done >= segCounters.size 会被提前满足而漏掉新段。
                 maybeSteal(t)
                 segDone(t)
+                return // v2.7：本段成功后退出重试循环
             } catch (e: Exception) {
-                if (!cancelled.get()) {
-                    Log.w(TAG, "segment error", e)
-                    // 任一段失败 → 标记失败并终止其余分段。
-                    // 否则其余分段跑完会触发 onFinished，把失败任务翻成"已完成"并合并不完整文件
-                    failed.set(true)
-                    cancelled.set(true)
-                    shutdownPool(now = true)
-                    closeWriteRaf()
-                    working = DownloadTask.Status.FAILED
-                    listener.onError(t.copy(status = working), e.message ?: "未知错误")
+                if (cancelled.get()) return
+                val recoverable = !RetryPolicy.isFatal(e) && RetryPolicy.isRecoverable(e)
+                if (recoverable && maxRetries > 0 && attempt < maxRetries) {
+                    attempt++
+                    Log.w(TAG, "segment recoverable error, retry $attempt/$maxRetries", e)
+                    onRetry(attempt, maxRetries)
+                    // 可打断的退避等待：用户暂停/取消时立即醒来，不空等 30s
+                    var waited = 0L
+                    val delay = RetryPolicy.delayMs(attempt)
+                    while (waited < delay && !cancelled.get()) {
+                        val step = minOf(200L, delay - waited)
+                        try { Thread.sleep(step) } catch (ie: InterruptedException) {
+                            Thread.currentThread().interrupt(); break
+                        }
+                        waited += step
+                    }
+                    continue // 重开连接，从 counter 的当前值继续
                 }
+                // 硬错误或重试耗尽 → 标记失败并终止其余分段。
+                // 否则其余分段跑完会触发 onFinished，把失败任务翻成"已完成"并合并不完整文件
+                Log.w(TAG, "segment error", e)
+                failed.set(true)
+                cancelled.set(true)
+                shutdownPool(now = true)
+                closeWriteRaf()
+                working = DownloadTask.Status.FAILED
+                listener.onError(t.copy(status = working), e.message ?: "未知错误")
+                return
             } finally {
                 try { raf?.close() } catch (e: Exception) {}
                 conn?.disconnect()
+            }
             }
         }
 
@@ -776,8 +817,11 @@ class DownloadEngine private constructor() {
     fun newJob(
         task: DownloadTask,
         listener: EngineListener,
-        throttle: (Int) -> Unit = {}
-    ): DownloadJob = DownloadJob(task, listener, throttle)
+        throttle: (Int) -> Unit = {},
+        availableBytes: () -> Long = { -1L },
+        maxRetries: Int = 0,
+        onRetry: (attempt: Int, max: Int) -> Unit = { _, _ -> }
+    ): DownloadJob = DownloadJob(task, listener, throttle, availableBytes, maxRetries, onRetry)
 
     /**
      * Range 探测：HEAD 失败自动退化 GET+Range（v1.0 行为）。

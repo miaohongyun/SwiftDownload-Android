@@ -55,6 +55,13 @@ class TransfersPage(
         fun pauseAll()
         fun resumeAll()
         fun clearCompleted()
+        /** v2.7 Stage1.1：刷新链接时是否保留断点（异步探测后回调 结果/提示） */
+        fun refreshLinkKeepProgress(
+            id: Long, newUrl: String, keep: Boolean, cb: (Boolean, String) -> Unit
+        ) {
+            cb(refreshLink(id, newUrl), "")
+        }
+
         /** 链接刷新：替换失效直链并从头重下 */
         fun refreshLink(id: Long, newUrl: String): Boolean
         /** 单任务限速，字节/秒；0 = 跟随全局 */
@@ -70,10 +77,18 @@ class TransfersPage(
         fun setBtSequential(id: Long, enabled: Boolean): Boolean = false
         fun isBtSequential(id: Long): Boolean = false
         fun btReadyVideoPath(id: Long): String? = null
+        /* v2.7 Stage1：任务详情 / 重连提示 / 剩余空间 */
+        fun retryHint(id: Long): String = ""
+        fun freeSpaceLabel(): String = ""
+        /** HTTP 分段数（无则用 -1 表示不适用） */
+        fun httpSegmentCount(id: Long): Int = -1
+        /** BT 做种/节点数；无则 null */
+        fun btSeedsPeers(id: Long): Pair<Int, Int>? = null
     }
 
     private var threadsPref = 4
     private val tvTotal: TextView
+    private lateinit var tvFreeSpace: TextView
     private val adapter = TaskAdapter()
     private val toolbar = FlowLayout(context)
 
@@ -100,6 +115,12 @@ class TransfersPage(
         }
         header.addView(settings)
         root.addView(header)
+
+        // v2.7 Stage1.3：剩余存储空间提示
+        tvFreeSpace = Ui.text(context, "", 11f, Ui.TXT_SUB)
+        root.addView(tvFreeSpace, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { leftMargin = Ui.dp(context, 14f); rightMargin = Ui.dp(context, 14f) })
 
         // v2.2：批量操作工具栏（v2.3 改流式布局，窄屏自动换行不裁切）
         toolbar.setPadding(Ui.dp(context, 14f), Ui.dp(context, 4f), Ui.dp(context, 14f), Ui.dp(context, 2f))
@@ -162,6 +183,12 @@ class TransfersPage(
         tvTotal.text = buildString {
             append("${tasks.size} 个任务")
             if (totalSpeed > 0) append(" · ").append(Format.speed(totalSpeed))
+        }
+        // v2.7 Stage1.3：剩余空间（从服务读取 StatFs，避免 UI 层重复解析根目录）
+        if (::tvFreeSpace.isInitialized) {
+            val free = controller.freeSpaceLabel()
+            tvFreeSpace.text = free
+            tvFreeSpace.visibility = if (free.isEmpty()) View.GONE else View.VISIBLE
         }
         toolbar.visibility = if (tasks.isEmpty()) View.GONE else View.VISIBLE
         adapter.submit(buildList {
@@ -441,6 +468,8 @@ class TransfersPage(
             val ctx = card.context
             card.removeAllViews()
             val st = t.status
+            // v2.7 Stage1.4：点击卡片非按钮区域弹出任务详情（子按钮各自消费点击，不会冒泡到这里）
+            card.setOnClickListener { showInspector(t) }
 
             // 名称行
             val nameRow = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
@@ -502,6 +531,11 @@ class TransfersPage(
                 // 不再与失败原因混用同一个红色提示
                 if (st == DownloadTask.Status.QUEUED && t.error.isNotEmpty()) {
                     append(" · ").append(t.error)
+                }
+                // v2.7 Stage1.2：瞬断重连提示
+                if (st == DownloadTask.Status.RUNNING) {
+                    val hint = controller.retryHint(t.id)
+                    if (hint.isNotEmpty()) append(" · ").append(hint)
                 }
             }
             card.addView(Ui.text(ctx, statusText, 13f, statusColor(st)),
@@ -644,24 +678,108 @@ class TransfersPage(
         private fun showRefreshDialog(t: DownloadTask) {
             val ctx = card.context
             val et = Ui.singleLineEt(ctx, "粘贴新的 http/https 直链").apply { setText(t.url) }
+            // v2.7 Stage1.1：默认勾选保留进度；仅当新链接大小一致且支持 Range 时生效
+            val keep = android.widget.CheckBox(ctx).apply {
+                text = "保留已下载进度继续（文件大小需一致）"
+                isChecked = true
+                textSize = 13f
+                setTextColor(Ui.TXT)
+            }
             val wrap = LinearLayout(ctx).apply {
                 orientation = LinearLayout.VERTICAL
                 setPadding(Ui.dp(ctx, 20f), Ui.dp(ctx, 8f), Ui.dp(ctx, 20f), 0)
                 addView(et, LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-                addView(Ui.text(ctx, "将替换原链接并清空进度，从头开始下载。", 11f, Ui.TXT_SUB),
+                addView(keep, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = Ui.dp(ctx, 8f) })
+                addView(Ui.text(ctx, "勾选时先探测新链接，大小一致且支持分段才续传，否则自动清空重下。", 11f, Ui.TXT_SUB),
                     LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
                         .apply { topMargin = Ui.dp(ctx, 6f) })
             }
             AlertDialog.Builder(ctx)
                 .setTitle("刷新链接 · ${t.fileName}")
                 .setView(wrap)
-                .setPositiveButton("保存并重下") { _, _ ->
-                    if (!controller.refreshLink(t.id, et.text.toString())) {
-                        Ui.toast(ctx, "请输入 http/https 开头的直链")
+                .setPositiveButton("保存") { _, _ ->
+                    controller.refreshLinkKeepProgress(t.id, et.text.toString(), keep.isChecked) { ok, msg ->
+                        Ui.toast(ctx, if (msg.isNotBlank()) msg else if (ok) "已刷新链接" else "请输入 http/https 开头的直链")
                     }
                 }
                 .setNegativeButton("取消", null)
+                .show()
+        }
+
+        /**
+         * v2.7 Stage1.4：任务详情弹窗。展示完整元数据，URL 点击可一键复制。
+         */
+        private fun showInspector(t: DownloadTask) {
+            val ctx = card.context
+            val box = LinearLayout(ctx).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(Ui.dp(ctx, 18f), Ui.dp(ctx, 6f), Ui.dp(ctx, 18f), 0)
+            }
+            fun row(label: String, value: String, copyable: Boolean = false) {
+                val line = Ui.text(ctx, "$label：$value", 13f, Ui.TXT)
+                if (copyable && value.isNotBlank()) {
+                    line.setTextColor(Ui.BLUE)
+                    line.setOnClickListener {
+                        try {
+                            val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            cm.setPrimaryClip(android.content.ClipData.newPlainText(label, value))
+                            Ui.toast(ctx, "已复制$label")
+                        } catch (e: Exception) { Ui.toast(ctx, "复制失败") }
+                    }
+                }
+                box.addView(line, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = Ui.dp(ctx, 6f) })
+            }
+
+            val pct = if (t.totalBytes > 0) "%.1f%%".format(t.downloadedBytes * 100.0 / t.totalBytes) else "—"
+            val kind = when {
+                t.isBt -> "BT 种子"
+                t.isM3u8 -> "HLS 流媒体"
+                else -> "多线程 HTTP"
+            }
+            val statusText = when (t.status) {
+                DownloadTask.Status.QUEUED -> "等待${if (t.error.isNotBlank()) "（${t.error}）" else ""}"
+                DownloadTask.Status.PROBING -> "准备就绪"
+                DownloadTask.Status.RUNNING -> "下载中"
+                DownloadTask.Status.PAUSED -> "暂停"
+                DownloadTask.Status.COMPLETED -> "已完成"
+                DownloadTask.Status.FAILED -> "失败"
+            }
+            row("文件名", t.fileName.ifEmpty { t.hash })
+            row("类型", kind)
+            row("状态", statusText)
+            if (t.error.isNotBlank()) row("错误/原因", t.error)
+            row("原始 URL", t.url, copyable = true)
+            if (t.finalUrl.isNotBlank() && t.finalUrl != t.url) row("最终 URL", t.finalUrl, copyable = true)
+            row("保存路径", t.savePath, copyable = true)
+            if (t.exportUri.isNotBlank()) row("导出 URI", t.exportUri, copyable = true)
+            row("总大小", if (t.totalBytes >= 0) Format.bytes(t.totalBytes) else "未知")
+            row("已下载", "${Format.bytes(t.downloadedBytes)}（$pct）")
+            row("线程数", t.threads.toString())
+            if (t.referer.isNotBlank()) row("Referer", t.referer, copyable = true)
+            if (t.cookie.isNotBlank()) row("Cookie", t.cookie, copyable = true)
+            // 引擎细节
+            if (t.isHttp) {
+                val seg = controller.httpSegmentCount(t.id)
+                if (seg > 0) row("HTTP 分段", "$seg 段")
+                val hint = controller.retryHint(t.id)
+                if (hint.isNotBlank()) row("网络状态", hint)
+            }
+            if (t.isBt) {
+                row("InfoHash", t.hash, copyable = true)
+                controller.btSeedsPeers(t.id)?.let { (seeds, peers) ->
+                    row("做种 / 节点", "$seeds / $peers")
+                }
+            }
+
+            AlertDialog.Builder(ctx)
+                .setTitle("任务详情")
+                .setView(Ui.verticalScroll(ctx, box))
+                .setPositiveButton("关闭", null)
                 .show()
         }
 

@@ -23,7 +23,8 @@ class Phase2RegressionTest {
 
     @Test
     fun `数据库v4只做增量ALTER且保留旧列`() {
-        assertEquals(4, DownloadDatabase.DB_VERSION)
+        // v2.7 Stage1.4 起 DB_VERSION 升到 5（新增 final_url），v4 迁移脚本本身不变
+        assertEquals(5, DownloadDatabase.DB_VERSION)
         assertEquals(3, DownloadDatabase.MIGRATE_V4.size)
         assertTrue(DownloadDatabase.MIGRATE_V4.all { it.startsWith("ALTER TABLE tasks ADD COLUMN") })
         val sql = DownloadDatabase.MIGRATE_V4.joinToString("\n")
@@ -32,6 +33,10 @@ class Phase2RegressionTest {
         assertTrue(sql.contains("export_uri"))
         assertFalse(sql.contains("DROP"))
         assertFalse(sql.contains("CREATE TABLE"))
+        // v5 同样是纯增量 ALTER
+        assertEquals(1, DownloadDatabase.MIGRATE_V5.size)
+        assertTrue(DownloadDatabase.MIGRATE_V5.all { it.startsWith("ALTER TABLE tasks ADD COLUMN") })
+        assertTrue(DownloadDatabase.MIGRATE_V5.joinToString().contains("final_url"))
     }
 
     @Test

@@ -22,6 +22,8 @@ class DownloadDatabase private constructor(ctx: Context) :
         db.execSQL("ALTER TABLE tasks ADD COLUMN referer TEXT NOT NULL DEFAULT ''")
         // v2.6.0：新建库也补齐 v4 列
         MIGRATE_V4.forEach(db::execSQL)
+        // v2.7：新建库也补齐 v5 列
+        MIGRATE_V5.forEach(db::execSQL)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -39,6 +41,10 @@ class DownloadDatabase private constructor(ctx: Context) :
             // v3 → v4：登录态/UA 透传 + MediaStore 导出 URI。
             // 全部 ALTER TABLE ADD COLUMN，老任务行原样保留。
             MIGRATE_V4.forEach(db::execSQL)
+        }
+        if (oldVersion < 5) {
+            // v4 → v5：最终重定向 URL（任务详情展示）。非破坏性增量迁移。
+            MIGRATE_V5.forEach(db::execSQL)
         }
     }
 
@@ -60,6 +66,7 @@ class DownloadDatabase private constructor(ctx: Context) :
         cv.put("cookie", task.cookie)
         cv.put("user_agent", task.userAgent)
         cv.put("export_uri", task.exportUri)
+        cv.put("final_url", task.finalUrl)
         return writableDatabase.insert("tasks", null, cv)
     }
 
@@ -96,6 +103,13 @@ class DownloadDatabase private constructor(ctx: Context) :
         writableDatabase.update("tasks", cv, "id=?", arrayOf(id.toString()))
     }
 
+    /** v2.7 Stage1.4：记录重定向后的最终 URL */
+    fun updateFinalUrl(id: Long, finalUrl: String) {
+        val cv = ContentValues()
+        cv.put("final_url", finalUrl)
+        writableDatabase.update("tasks", cv, "id=?", arrayOf(id.toString()))
+    }
+
     /** v2.5：文件改名后同步落盘路径。
      * 服务器 Content-Disposition 给出的真实文件名可能与初始 URL 推断名不同，
      * 若不同步 save_path，完成后的文件会"找不到"（打开/投屏都会失败）。
@@ -103,6 +117,16 @@ class DownloadDatabase private constructor(ctx: Context) :
     fun updateSavePath(id: Long, savePath: String) {
         val cv = ContentValues()
         cv.put("save_path", savePath)
+        writableDatabase.update("tasks", cv, "id=?", arrayOf(id.toString()))
+    }
+
+    /** v2.7 Stage1.1：仅更新链接与认证头，保留 total_bytes/downloaded_bytes/status/进度文件 */
+    fun updateUrlKeepProgress(id: Long, url: String, referer: String, cookie: String) {
+        val cv = ContentValues()
+        cv.put("url", url)
+        cv.put("referer", referer)
+        cv.put("cookie", cookie)
+        cv.put("error", "")
         writableDatabase.update("tasks", cv, "id=?", arrayOf(id.toString()))
     }
 
@@ -136,7 +160,7 @@ class DownloadDatabase private constructor(ctx: Context) :
     fun all(): List<DownloadTask> {
         val out = ArrayList<DownloadTask>()
         readableDatabase.rawQuery(
-            "SELECT id,url,file_name,save_path,total_bytes,downloaded_bytes,status,threads,error,created_at,kind,hash,variant,referer,cookie,user_agent,export_uri FROM tasks ORDER BY id DESC",
+            "SELECT id,url,file_name,save_path,total_bytes,downloaded_bytes,status,threads,error,created_at,kind,hash,variant,referer,cookie,user_agent,export_uri,final_url FROM tasks ORDER BY id DESC",
             null
         ).use { c ->
             while (c.moveToNext()) {
@@ -157,7 +181,8 @@ class DownloadDatabase private constructor(ctx: Context) :
                     referer = c.getString(13) ?: "",
                     cookie = c.getString(14) ?: "",
                     userAgent = c.getString(15) ?: "",
-                    exportUri = c.getString(16) ?: ""
+                    exportUri = c.getString(16) ?: "",
+                    finalUrl = c.getString(17) ?: ""
                 ))
             }
         }
@@ -166,13 +191,18 @@ class DownloadDatabase private constructor(ctx: Context) :
 
     companion object {
         const val DB_NAME = "swift_download.db"
-        const val DB_VERSION = 4
+        const val DB_VERSION = 5
 
         /** v2.6.0：v3 → v4 的全部增量列（纯 ALTER，老数据零改动） */
         val MIGRATE_V4 = listOf(
             "ALTER TABLE tasks ADD COLUMN cookie TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE tasks ADD COLUMN user_agent TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE tasks ADD COLUMN export_uri TEXT NOT NULL DEFAULT ''"
+        )
+
+        /** v2.7 Stage1.4：v4 → v5 增量列（纯 ALTER，老数据零改动） */
+        val MIGRATE_V5 = listOf(
+            "ALTER TABLE tasks ADD COLUMN final_url TEXT NOT NULL DEFAULT ''"
         )
 
         /** v1.0 建表语句原文（从 v1.0 APK 中逐字符提取） */

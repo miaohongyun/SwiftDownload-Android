@@ -81,6 +81,28 @@ object StorageRoots {
         }
     }
 
+    /**
+     * v2.7 Stage1.3：目录所在存储剩余可用字节数（基于 StatFs）。
+     * 失败/未知返回 -1，[StorageGuard] 会据此跳过校验，不误伤下载。
+     */
+    fun availableBytes(dir: File): Long = try {
+        val target = if (dir.isDirectory) dir else (dir.parentFile ?: dir)
+        val stat = android.os.StatFs(target.absolutePath)
+        @Suppress("DEPRECATION")
+        val available: Long = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.JELLY_BEAN_MR2) {
+            stat.availableBytes
+        } else (stat.availableBlocks.toLong() * stat.blockSize.toLong())
+        available
+    } catch (e: Exception) {
+        -1L
+    }
+
+    /** 供 UI 显示的剩余空间文案，如「剩余 18.4 GB」；无法判定时返回空串 */
+    fun freeSpaceLabel(dir: File): String {
+        val free = availableBytes(dir)
+        return if (free < 0L) "" else "剩余 ${Format.bytes(free)}"
+    }
+
     /** 供单元测试调用（生产代码不依赖） */
     fun isWritableForTest(dir: File): Boolean = isWritable(dir)
 }

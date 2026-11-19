@@ -271,6 +271,8 @@ class M3u8Job(
                 last = e
                 if (temp.exists()) temp.delete()
                 if (target.exists()) target.delete()
+                // v2.7 Stage1.2：硬错误（404/403/完整性/解密）不重试，避免对失效分片空等
+                if (com.swift.download.settings.RetryPolicy.isFatal(e)) throw e
                 if (attempt < 3) {
                     try { Thread.sleep(100L shl attempt) } catch (ie: InterruptedException) {
                         Thread.currentThread().interrupt(); return

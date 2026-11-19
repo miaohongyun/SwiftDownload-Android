@@ -27,6 +27,7 @@ class DownloadSettingsPage(
 
         root.addView(titleCard())
         root.addView(speedCard())
+        root.addView(retryCard())
         root.addView(networkCard())
         root.addView(scheduleCard())
         root.addView(concurrencyCard())
@@ -80,6 +81,32 @@ class DownloadSettingsPage(
             val v = et.text.toString().trim().toLongOrNull() ?: 0L
             settings.globalLimitBps = v.coerceAtLeast(0) * 1024 * 1024
             Ui.toast(context, if (v > 0) "全局限速 $v MB/s" else "已取消限速")
+        }
+        card.addView(save, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = Ui.dp(context, 8f) })
+        card.layoutParams = cardLp()
+        return card
+    }
+
+    /** v2.7 Stage1.2：网络瞬断自动重试次数（0..5，0 = 关闭） */
+    private fun retryCard(): View {
+        val card = Ui.card(context)
+        card.addView(Ui.text(context, "网络重连", 15f, Ui.TXT, bold = true))
+        val et = Ui.singleLineEt(context, "0 = 关闭自动重试").apply {
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            setText(settings.autoRetryCount.toString())
+        }
+        card.addView(et, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = Ui.dp(context, 8f) })
+        card.addView(Ui.text(context, "瞬断/5xx 自动重试 0~5 次（间隔 3s→10s→30s）；0 表示失败即停。", 11f, Ui.TXT_SUB),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { topMargin = Ui.dp(context, 4f) })
+        val save = Ui.pillBtn(context, "保存", Ui.BLUE, filled = true) {
+            val v = et.text.toString().trim().toIntOrNull() ?: 0
+            settings.autoRetryCount = v
+            Ui.toast(context, if (v > 0) "自动重试 $v 次" else "已关闭自动重试")
         }
         card.addView(save, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT

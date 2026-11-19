@@ -25,7 +25,9 @@ data class DownloadTask(
     val cookie: String = "",
     val userAgent: String = "",
     /** MediaStore 导出后的 content:// URI（v4 迁移，供打开/重播兜底） */
-    val exportUri: String = ""
+    val exportUri: String = "",
+    /** v2.7 Stage1.4：重定向后的最终 URL（v5 迁移，任务详情展示） */
+    val finalUrl: String = ""
 ) {
     enum class Status private constructor(val value: Int, val label: String) {
         QUEUED(0, "等待"),

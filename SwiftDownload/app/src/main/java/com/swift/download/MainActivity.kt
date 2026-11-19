@@ -637,6 +637,16 @@ class MainActivity : AppCompatActivity() {
         }
         override fun refreshLink(id: Long, newUrl: String): Boolean =
             binder?.refreshLink(id, newUrl) == true
+        override fun refreshLinkKeepProgress(
+            id: Long, newUrl: String, keep: Boolean, cb: (Boolean, String) -> Unit
+        ) {
+            val b = binder
+            if (b == null) cb(false, "服务未连接") else b.refreshLinkKeepProgress(id, newUrl, keep, cb)
+        }
+        override fun retryHint(id: Long): String = binder?.retryHint(id).orEmpty()
+        override fun freeSpaceLabel(): String = binder?.freeSpaceLabel().orEmpty()
+        override fun httpSegmentCount(id: Long): Int = binder?.httpSegmentCount(id) ?: -1
+        override fun btSeedsPeers(id: Long): Pair<Int, Int>? = binder?.btSeedsPeers(id)
         override fun setTaskLimit(id: Long, bps: Long) {
             binder?.setTaskLimitBps(id, bps)
         }
