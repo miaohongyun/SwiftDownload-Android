@@ -67,6 +67,7 @@ private const val DB_WRITE_MS = 1000L
 /** v2.8 模块一：BT 诊断信息（纯数据，跨 Binder 传递，不暴露 jlibtorrent 类型） */
 data class BtDiag(
     val dhtNodes: Long,
+    val trackerCount: Int,
     val stateLabel: String,
     val trackerError: String,
     val seeds: Int,
@@ -176,6 +177,7 @@ class DownloadService : Service() {
             val p = com.swift.download.bt.TorrentEngine.get().progressOf(hash) ?: return null
             return BtDiag(
                 dhtNodes = p.dhtNodes,
+                trackerCount = p.trackerCount,
                 stateLabel = p.stateLabel,
                 trackerError = p.trackerError,
                 seeds = p.seeds,

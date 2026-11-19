@@ -149,7 +149,9 @@ class MainActivity : AppCompatActivity() {
                 switchTo(1)
                 Ui.toast(this, "视频任务已添加")
             },
-            onTorrentLink = { url, _, _ -> addTorrentFromUrl(url) }
+            onTorrentLink = { url, _, _ -> addTorrentFromUrl(url) },
+            // v2.9.0：浏览器首页「影视站搜（免代理）」→ 磁力搜页的影视站直搜模式
+            onOpenSiteSearch = { kw -> openMagnetSearch(kw, siteMode = true) }
         )
         transfersPage = TransfersPage(this, transferController)
         filesPage = FilesPage(this, onCast = { path -> showCastPicker(java.io.File(path).name, path) })
@@ -610,21 +612,31 @@ class MainActivity : AppCompatActivity() {
     private fun showAbout() {
         android.app.AlertDialog.Builder(this)
             .setTitle("极速下载")
-            .setMessage("v$versionLabel\n\n· 多线程 HTTP 下载 · 断点续传 · 慢连接智能接管\n· 磁力聚合搜索（5 源）· BT 选文件 / 顺序下载\n· 内置多标签浏览器 · 嗅探角标 · 剪贴板识别\n· HLS 加密流（AES-128）/ 清晰度可选下载\n· 边下边播（零拷贝）· DLNA 投屏（DIDL 元数据）\n· 限速 / 仅 Wi-Fi / 时段调度 / 并发队列 / 文件分类\n· 完成后导出公共下载 · MD5/SHA 校验 · 局域网投递\n\nv2.6.0 修复并发竞态、线程池泄漏、API 24 启动兼容，\n并新增 HLS 解密、Work Stealing、Cookie 透传、MediaStore 导出。")
+            .setMessage("v$versionLabel\n\n· 多线程 HTTP 下载 · 断点续传 · 慢连接智能接管\n· 磁力聚合搜索 · 影视站直搜（免代理）· BT 选文件 / 顺序下载\n· 内置多标签浏览器 · 嗅探角标 · 剪贴板识别\n· HLS 加密流（AES-128）/ 清晰度可选下载\n· 边下边播（零拷贝）· DLNA 投屏（DIDL 元数据）\n· 限速 / 仅 Wi-Fi / 时段调度 / 并发队列 / 文件分类\n· 完成后导出公共下载 · MD5/SHA 校验 · 局域网投递\n\nv2.6.0 修复并发竞态、线程池泄漏、API 24 启动兼容，\n并新增 HLS 解密、Work Stealing、Cookie 透传、MediaStore 导出。")
             .setPositiveButton("确定", null)
             .show()
     }
 
     /* ---------------- 磁力搜索浮层 ---------------- */
 
-    private fun openMagnetSearch(keyword: String) {
-        val page = MagnetSearchPage(this) { magnetUri ->
-            addMagnet(magnetUri)
-            closeOverlay()
-        }
+    private fun openMagnetSearch(keyword: String, siteMode: Boolean = false) {
+        val page = MagnetSearchPage(
+            this,
+            onDownload = { magnetUri ->
+                addMagnet(magnetUri)
+                closeOverlay()
+            },
+            onOpenSite = { url ->
+                // 影视站直搜：站内搜索结果直接在浏览器打开，详情页用「抓资源」提取磁力
+                closeOverlay()
+                browserPage.newTab(url)
+                switchTo(0)
+            },
+            initialSiteMode = siteMode
+        )
         magnetSearchPage = page
-        showOverlay(page, "磁力搜索")
-        if (keyword.isNotEmpty()) page.prefillKeyword(keyword)
+        showOverlay(page, if (siteMode) "影视站直搜（免代理）" else "磁力搜索")
+        if (keyword.isNotEmpty() && !siteMode) page.prefillKeyword(keyword)
     }
 
     /** v2.6.0：浮层统一加「← 返回 + 标题」导航栏，不再只能靠系统手势/返回键退出 */
@@ -677,12 +689,9 @@ class MainActivity : AppCompatActivity() {
 
     override fun onBackPressed() {
         if (overlay != null) { closeOverlay(); return }
-        if (currentPage == 0 && browserPage.isInWebMode() &&
-            browserPage.currentWebView()?.canGoBack() == true
-        ) {
-            browserPage.currentWebView()?.goBack()
-            return
-        }
+        // v2.9：网页态返回由 BrowserPage 统一处理（有历史 goBack / 无历史回首页）；
+        // 首页态返回 false，继续走下面的二次退出确认。
+        if (currentPage == 0 && browserPage.handleBack()) return
         // v2.2：双击返回退出（防误触）
         val now = android.os.SystemClock.elapsedRealtime()
         if (now - lastBackAt < 2000) {

@@ -4,6 +4,36 @@
 
 ---
 
+## v2.9.0 — BT 引擎升级与手机单手交互重做（2026-11-19）
+
+版本号 `versionCode 14 / versionName 2.9.0`。`minSdk` 从 24 提升到 26（Android 8.0+）。
+
+### 任务一 — 彻底解决 BT 不可达
+- 移除 `libs/jlibtorrent-1.2.0.18.jar` 与 `jniLibs/` 下旧 `.so`（2018 年版本默认绑定 `NETLINK_ROUTE`，在 Android 11+ 被 SELinux 拦截，枚举不到网卡导致 DHT/tracker 全失效）。
+- 接入 FrostWire 官方 Maven `https://dl.frostwire.com/maven`，依赖升级为 `com.frostwire:jlibtorrent-android:2.1.2.1`（libtorrent 2.x，自带 arm64/arm/x86 .so 与 R8 规则），`abiFilters` 只保留 `arm64-v8a`、`armeabi-v7a`。
+- 适配 2.x API：`setEnableDht/setEnableLsd`、`maxQueuedDiskBytes`、`setDhtBootstrapNodes`、magnet 下载显式 `torrent_flags_t`、`Sha1Hash` 取法、`infoHashV1/V2`、`MetadataReceivedAlert` 改从 handle 取 `torrentFile()`、移除已删除的 `ALLOCATING` 状态。
+- `listenInterfaces` 改为 `0.0.0.0:0,[::]:0`（5G IPv6 优先）；内置 DHT 引导节点 4 个；`announce_to_all_trackers/tiers` 全开。
+- 内置 tracker 扩到 27 个 HTTP/HTTPS/UDP 混合列表；`.torrent` 文件也通过 `handle.addTracker` 补齐。
+- 传输页 BT 任务卡新增独立诊断行：`等待元数据 · DHT节点 X · Tracker Y · 已连节点 Z`，0 值如实展示，详情里同步列出 Tracker/已连节点。
+
+### 任务二 — 浏览器重做为真正的手机单手操作
+- 首页删除顶部蓝色标签条与 ←→⟳⌂☆⋮ 六个按钮；只保留全宽圆角地址框（内含清除/嗅探）、磁力搜与影视站搜入口、3 列书签卡。
+- 修复书签文字被拦腰截断：卡片高度改 `WRAP_CONTENT + minHeight 96dp`，标题最多两行完整显示。
+- 网页态顶部仅标题胶囊 + 3dp 进度条 + 抓资源/N + ⋮；底部紧贴主导航上方是 5 等分大触控键（后退/前进/刷新或停止/收藏/标签数），禁用态不可点。
+- 收藏改为居中确认弹窗；标签管理改为底部抽屉（新建/切换/关闭/回首页）；返回键统一由 `BrowserPage.handleBack()` 处理（有历史回退、无历史回首页）。
+- 底部浏览器图标由易误认为禁止符的「圆+横线」改为指南针矢量绘制。
+
+### 任务三 — 磁力搜索可达性
+- 删除长期失效的 磁力猫/柠檬BT/SkrBT 默认源；TorrentKitty、动漫花园标注「需代理」。
+- 磁力搜页新增「全网磁力索引 / 影视站直搜（免代理）」双模式；影视站直搜用关键词套站内模板（高清族/电影港/SeedHub，可长按添加自定义模板），打开详情页后用「抓资源」提取 magnet。
+- 默认书签域名修正为 `https://cn.bing.com`、`https://hdzu.cc`；旧持久化数据中的失效域名就地迁移。
+- 全部源超时且未开 HTTP 代理时主动提示改用影视站直搜或浏览器抓资源。
+
+### 验证
+- `testDebugUnitTest` 209/209、`lintDebug` 0 Error、`assembleRelease` 成功；`aapt2` 校验 APK 内为新版 `libjlibtorrent.so`。
+
+---
+
 ## v2.8.0 — 真实用性重构（2026-11-19）
 
 版本号 `versionCode 13 / versionName 2.8.0`。围绕「真正能稳定下载」与「单手好用的浏览器」，

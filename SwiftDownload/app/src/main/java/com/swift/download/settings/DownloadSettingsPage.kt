@@ -301,6 +301,29 @@ class DownloadSettingsPage(
         card.addView(save, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = Ui.dp(context, 8f) })
+
+        // v2.9.0：一键区分 HTTP 直连故障与 BT/P2P 故障
+        val testDirect = Ui.pillBtn(context, "测试 HTTP 直连", Ui.BLUE) {
+            Thread {
+                val result = try {
+                    val c = com.swift.download.HttpUtil.open(
+                        "https://cn.bing.com", range = "bytes=0-1023"
+                    )
+                    try {
+                        val code = c.responseCode
+                        if (code in 200..399) "HTTP 直连正常（$code），BT 不通请检查 DHT/Tracker"
+                        else "HTTP 返回 $code，先排查网络或代理"
+                    } finally { c.disconnect() }
+                } catch (e: Exception) {
+                    "HTTP 直连失败：${e.message ?: "未知错误"}（不是 BT 引擎问题）"
+                }
+                post { Ui.toast(context, result) }
+            }.apply { isDaemon = true }.start()
+            Ui.toast(context, "正在测试 HTTP 直连…")
+        }
+        card.addView(testDirect, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = Ui.dp(context, 8f) })
         card.layoutParams = cardLp()
         return card
     }

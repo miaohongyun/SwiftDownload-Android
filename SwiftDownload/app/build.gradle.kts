@@ -9,10 +9,16 @@ android {
 
     defaultConfig {
         applicationId = "com.swift.download"
-        minSdk = 24
+        // v2.9.0：新版 jlibtorrent AAR（libtorrent 2.x）最低要求 Android 8.0；
+        // 旧 1.2.0.18 的 NETLINK_ROUTE 在 Android 11+ 被 SELinux 拦截，BT 永远连不上节点。
+        minSdk = 26
         targetSdk = 36
-        versionCode = 13
-        versionName = "2.8.0"
+        versionCode = 14
+        versionName = "2.9.0"
+        ndk {
+            // 只打包真机常用架构，避免 65MB 全架构 AAR 直接进 APK
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -68,7 +74,8 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.recyclerview:recyclerview:1.3.2")
     implementation("androidx.webkit:webkit:1.11.0")
-    implementation(files("libs/jlibtorrent-1.2.0.18.jar"))
+    // v2.9.0：FrostWire 官方 libtorrent 2.x AAR（含 arm64/arm .so + R8 keep rules）
+    implementation("com.frostwire:jlibtorrent-android:2.1.2.1")
 
     testImplementation("junit:junit:4.13.2")
 }

@@ -52,7 +52,9 @@ class BrowserPage(
     /** 嗅探到页面视频：master 地址、建议文件名、来源页 Referer */
     private val onVideoDetected: (url: String, name: String, referer: String, cookie: String) -> Unit,
     /** v2.8 模块一：.torrent 链接 → 拉取种子到缓存后直接建 BT 任务 */
-    private val onTorrentLink: (url: String, referer: String, cookie: String) -> Unit = { _, _, _ -> }
+    private val onTorrentLink: (url: String, referer: String, cookie: String) -> Unit = { _, _, _ -> },
+    /** v2.9：首页「影视站搜（免代理）」胶囊入口 */
+    private val onOpenSiteSearch: (keyword: String) -> Unit = { _ -> }
 ) : FrameLayout(context) {
 
     data class Tab(
@@ -61,7 +63,9 @@ class BrowserPage(
         var url: String,
         var webView: WebView? = null,
         /** v2.6.0：本标签嗅探到的视频链接（url → 名称），角标与复核用 */
-        val sniffed: LinkedHashMap<String, String> = LinkedHashMap()
+        val sniffed: LinkedHashMap<String, String> = LinkedHashMap(),
+        /** v2.9：本标签「抓资源」命中的资源数，切换标签后顶部按钮角标随之同步 */
+        var grabCount: Int = 0
     )
 
     private var nextId = 1
@@ -85,8 +89,16 @@ class BrowserPage(
     private lateinit var bottomToolbar: LinearLayout
     private lateinit var btnBack: TextView
     private lateinit var btnForward: TextView
-    /** v2.8 模块四 4.1：一键抓资源按钮（发现资源时文字高亮） */
+    /** v2.9：网页态顶部紧凑 chrome（标题胶囊 + 抓资源 + 更多） */
+    private lateinit var topChrome: LinearLayout
+    /** v2.8 模块四 4.1：一键抓资源按钮（v2.9 起挂到网页态顶部右侧） */
     private lateinit var btnGrab: TextView
+    /** v2.9：底部第 3 键，加载中显示 ■（停止），否则显示 ↻（刷新） */
+    private lateinit var btnRefresh: TextView
+    /** v2.9：底部第 5 键，标题带标签数量，点击弹出底部标签抽屉 */
+    private lateinit var btnTabs: TextView
+    /** v2.9：当前页面是否处于加载中，驱动 btnRefresh 的 ↻/■ 状态 */
+    private var isLoading = false
 
     /** v2.7 Stage3.2：桌面版 UA 标志（切换后自动刷新当前页） */
     private var desktopMode = false
@@ -129,19 +141,19 @@ class BrowserPage(
         }
         root.addView(progress, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(context, 3f)))
 
-        // 标签条
-        tabsStrip = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(Ui.dp(context, 8f), Ui.dp(context, 4f), Ui.dp(context, 8f), Ui.dp(context, 4f))
-        }
+        // v2.9：顶部蓝色标签条彻底移出视图树。字段保留仅为兼容旧代码引用，
+        // 多标签改由网页态底部第 5 键「⊞ 标签」抽屉管理。
+        tabsStrip = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
         tabsScroller = Ui.horizontalScroll(context, tabsStrip)
-        root.addView(tabsScroller, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        // 地址栏容器（v2.8：整块可折叠，网页态默认收起为紧凑标题）
-        addressBar = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
-        val bar = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        // v2.9 地址栏：首页只留一个全宽圆角输入框，内部右侧 ✕ 清除 + 嗅探小图标。
+        // 原 ← → ⟳ ⌂ ☆ ⋮ 六个顶部按钮全部移除，功能迁到网页态顶部 chrome / 底部工具栏。
+        addressBar = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(Ui.dp(context, 12f), Ui.dp(context, 10f), Ui.dp(context, 12f), 0)
+        }
         etUrl = Ui.singleLineEt(context, "输入地址或搜索内容").apply {
-            setPadding(Ui.dp(context, 12f), Ui.dp(context, 8f), Ui.dp(context, 12f), Ui.dp(context, 8f))
+            setPadding(Ui.dp(context, 12f), Ui.dp(context, 12f), Ui.dp(context, 4f), Ui.dp(context, 12f))
             imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_GO
             setOnEditorActionListener { _, actionId, _ ->
                 if (actionId == android.view.inputmethod.EditorInfo.IME_ACTION_GO) { go(); true } else false
@@ -149,17 +161,28 @@ class BrowserPage(
             // v2.7 Stage3.2：聚焦自动全选，方便一键复制或覆盖输入
             setOnFocusChangeListener { _, hasFocus -> if (hasFocus) post { selectAll() } }
         }
-        val barCard = Ui.card(context, 18f)
         val urlRow = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        urlRow.addView(etUrl, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        // v2.7 Stage3.2：地址栏清空 ✕
+        urlRow.addView(etUrl, LinearLayout.LayoutParams(0, Ui.dp(context, 48f), 1f))
+        // 地址栏清空 ✕：固定 48dp 见方热区
         val clearUrl = TextView(context).apply {
             text = "✕"; textSize = 15f; setTextColor(Ui.TXT_SUB)
-            setPadding(Ui.dp(context, 6f), Ui.dp(context, 4f), Ui.dp(context, 4f), Ui.dp(context, 4f))
+            gravity = Gravity.CENTER
+            contentDescription = "清空地址"
             visibility = GONE
+            Ui.pressable(this)
             setOnClickListener { etUrl.setText(""); etUrl.requestFocus() }
         }
-        urlRow.addView(clearUrl, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        urlRow.addView(clearUrl, LinearLayout.LayoutParams(Ui.dp(context, 48f), Ui.dp(context, 48f)))
+        // 嗅探常驻小图标：48dp 热区，首页态点击由 showSniffSheet 给出轻提示
+        val sniffIcon = TextView(context).apply {
+            text = "嗅探"; textSize = 12f; setTextColor(Ui.BLUE)
+            gravity = Gravity.CENTER
+            contentDescription = "嗅探页面视频"
+            Ui.pressable(this)
+            setOnClickListener { showSniffSheet() }
+        }
+        sniffBadge = sniffIcon
+        urlRow.addView(sniffIcon, LinearLayout.LayoutParams(Ui.dp(context, 56f), Ui.dp(context, 48f)))
         etUrl.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
             override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
@@ -167,43 +190,77 @@ class BrowserPage(
                 clearUrl.visibility = if (s.isNullOrEmpty()) GONE else VISIBLE
             }
         })
-        barCard.addView(urlRow)
-        bar.addView(barCard, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        for ((label, act) in listOf<Pair<String, () -> Unit>>(
-            "←" to { current?.webView?.goBack() },
-            "→" to { current?.webView?.goForward() },
-            "⟳" to { current?.webView?.reload() },
-            "⌂" to { goHome() },
-            "☆" to { bookmarkCurrentPage() },
-            "嗅探" to { showSniffSheet() },
-            "⋮" to { showBrowserMenu() }
-        )) {
-            val b = TextView(context).apply {
-                text = label; textSize = if (label == "嗅探") 12f else 18f
-                gravity = Gravity.CENTER
-                setTextColor(if (label == "嗅探") Ui.BLUE else Ui.TXT)
-                setPadding(Ui.dp(context, 6f), Ui.dp(context, 6f), Ui.dp(context, 6f), Ui.dp(context, 6f))
-                setOnClickListener { act() }
-            }
-            if (label == "嗅探") sniffBadge = b
-            bar.addView(b)
-        }
-        addressBar.addView(bar)
-        root.addView(addressBar)
+        val barCard = Ui.card(context, 18f)
+        barCard.setPadding(Ui.dp(context, 8f), Ui.dp(context, 4f), Ui.dp(context, 4f), Ui.dp(context, 4f))
+        barCard.addView(urlRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        addressBar.addView(barCard, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        // v2.8 模块二：网页态紧凑标题栏（点击展开地址输入）
+        // v2.9：地址框下方紧凑入口行（两个等权胶囊，各 48dp 热区）
+        val entryRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val magEntry = Ui.pillBtn(context, "磁力搜", Ui.BLUE) { onOpenMagnetSearch("") }.apply {
+            minHeight = Ui.dp(context, 48f)
+            contentDescription = "磁力搜"
+        }
+        entryRow.addView(magEntry, LinearLayout.LayoutParams(0, Ui.dp(context, 48f), 1f).apply {
+            marginEnd = Ui.dp(context, 8f)
+        })
+        val siteEntry = Ui.pillBtn(context, "影视站搜（免代理）", Ui.BLUE) { onOpenSiteSearch("") }.apply {
+            minHeight = Ui.dp(context, 48f)
+            contentDescription = "影视站搜（免代理）"
+        }
+        entryRow.addView(siteEntry, LinearLayout.LayoutParams(0, Ui.dp(context, 48f), 1f))
+        addressBar.addView(entryRow, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = Ui.dp(context, 8f) })
+        root.addView(addressBar, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+
+        // v2.9：网页态顶部紧凑 chrome = 标题/域名胶囊(weight=1) + 抓资源 + ⋮
+        topChrome = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = GONE
+        }
         compactTitle = TextView(context).apply {
             text = ""; textSize = 14f; maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
+            gravity = Gravity.CENTER_VERTICAL
             setTextColor(Ui.TXT)
-            setPadding(Ui.dp(context, 16f), Ui.dp(context, 12f), Ui.dp(context, 16f), Ui.dp(context, 12f))
-            visibility = GONE
+            setPadding(Ui.dp(context, 12f), Ui.dp(context, 10f), Ui.dp(context, 12f), Ui.dp(context, 10f))
             background = android.graphics.drawable.GradientDrawable().apply {
                 setColor(Ui.CARD); cornerRadius = Ui.dp(context, 16f).toFloat()
             }
+            contentDescription = "展开地址栏编辑"
+            Ui.pressable(this)
             setOnClickListener { expandAddressBar() }
         }
-        root.addView(compactTitle, LinearLayout.LayoutParams(
+        topChrome.addView(compactTitle, LinearLayout.LayoutParams(0, Ui.dp(context, 48f), 1f).apply {
+            marginEnd = Ui.dp(context, 8f)
+        })
+        btnGrab = TextView(context).apply {
+            text = "抓资源"; textSize = 13f; gravity = Gravity.CENTER
+            setPadding(Ui.dp(context, 10f), Ui.dp(context, 6f), Ui.dp(context, 10f), Ui.dp(context, 6f))
+            contentDescription = "抓资源，未发现资源"
+            Ui.pressable(this)
+            setOnClickListener { grabPageResources() }
+        }
+        topChrome.addView(btnGrab, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, Ui.dp(context, 48f)
+        ).apply { marginEnd = Ui.dp(context, 8f) })
+        val btnMore = TextView(context).apply {
+            text = "⋮"; textSize = 20f; gravity = Gravity.CENTER
+            setTextColor(Ui.TXT)
+            setPadding(Ui.dp(context, 4f), Ui.dp(context, 6f), Ui.dp(context, 4f), Ui.dp(context, 6f))
+            contentDescription = "更多浏览器功能"
+            Ui.pressable(this)
+            setOnClickListener { showBrowserMenu() }
+        }
+        topChrome.addView(btnMore, LinearLayout.LayoutParams(Ui.dp(context, 48f), Ui.dp(context, 48f)))
+        root.addView(topChrome, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { setMargins(Ui.dp(context, 12f), Ui.dp(context, 6f), Ui.dp(context, 12f), 0) })
 
@@ -234,45 +291,81 @@ class BrowserPage(
         WebViewProxyManager.apply(context)
     }
 
-    /** v2.8 模块二：底部工具栏（后退/前进/刷新/添加书签/首页或标签） */
+    /** v2.9：底部工具栏严格 5 等分大按钮（← / → / ↻■ / ☆ / ⊞N），紧贴主导航上方 */
     private fun buildBottomToolbar(): LinearLayout {
         val ctx = context
         val bar = LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
             setBackgroundColor(Ui.CARD)
-            setPadding(Ui.dp(ctx, 8f), Ui.dp(ctx, 8f), Ui.dp(ctx, 8f), Ui.dp(ctx, 8f))
+            setPadding(Ui.dp(ctx, 4f), Ui.dp(ctx, 6f), Ui.dp(ctx, 4f), Ui.dp(ctx, 6f))
         }
-        /** 单色符号统一 tint，彩色 emoji「🎬」改为文字「抓」；每个键带无障碍描述 */
+        /** 单色符号 + 无障碍描述 + 48dp 以上热区 + 涟漪；禁用态由 refreshNavButtons 统一处理 */
         fun tool(glyph: String, desc: String, act: () -> Unit): TextView = TextView(ctx).apply {
             text = glyph; textSize = 20f; gravity = Gravity.CENTER
             contentDescription = desc
             setTextColor(Ui.BLUE)
-            setPadding(Ui.dp(ctx, 12f), Ui.dp(ctx, 10f), Ui.dp(ctx, 12f), Ui.dp(ctx, 10f))
+            setPadding(Ui.dp(ctx, 4f), Ui.dp(ctx, 8f), Ui.dp(ctx, 4f), Ui.dp(ctx, 8f))
+            minHeight = Ui.dp(ctx, 48f)
             Ui.pressable(this)
             setOnClickListener { act() }
         }
         btnBack = tool("←", "后退") { current?.webView?.goBack() }
         btnForward = tool("→", "前进") { current?.webView?.goForward() }
-        bar.addView(btnBack, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        bar.addView(btnForward, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        bar.addView(tool("↻", "刷新") { current?.webView?.reload() },
-            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        bar.addView(tool("☆", "添加书签") { bookmarkCurrentPage() },
-            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        // 第5键：单击回首页，长按弹出多标签管理
-        val homeTab = tool("⌂", "首页") { goHome() }
-        homeTab.setOnLongClickListener { showTabManager(); true }
-        bar.addView(homeTab, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        // v2.8 模块四 4.1：一键抓本页磁力/视频资源
-        btnGrab = tool("抓", "抓资源") { grabPageResources() }
-        bar.addView(btnGrab, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        btnRefresh = tool("↻", "刷新") { toggleRefreshOrStop() }
+        val btnStar = tool("☆", "添加到主页") { showAddHomeDialog() }
+        btnTabs = tool("⊞ 1", "标签管理") { showTabManager() }
+        for (b in arrayOf(btnBack, btnForward, btnRefresh, btnStar, btnTabs)) {
+            bar.addView(b, LinearLayout.LayoutParams(0, Ui.dp(ctx, 56f), 1f))
+        }
         return bar
+    }
+
+    /** v2.9：刷新/停止二态切换：加载中点 ■ 停止并调用 wv.stopLoading() */
+    private fun toggleRefreshOrStop() {
+        val wv = current?.webView
+        if (isLoading && wv != null) {
+            try { wv.stopLoading() } catch (_: Exception) {}
+            isLoading = false
+            progress.visibility = GONE
+        } else {
+            wv?.reload()
+        }
+        updateRefreshButton()
+    }
+
+    /** v2.9：同步刷新键字形与无障碍描述 */
+    private fun updateRefreshButton() {
+        if (!::btnRefresh.isInitialized) return
+        btnRefresh.text = if (isLoading) "■" else "↻"
+        btnRefresh.contentDescription = if (isLoading) "停止加载" else "刷新"
+        btnRefresh.setTextColor(if (isLoading) Ui.ORANGE else Ui.BLUE)
+    }
+
+    /** v2.9：抓资源按钮蓝底/灰底同步（发现资源时蓝底白字，0 时浅底灰字） */
+    private fun updateGrabButton(n: Int) {
+        if (!::btnGrab.isInitialized) return
+        val found = n > 0
+        btnGrab.text = if (found) "抓资源($n)" else "抓资源"
+        btnGrab.setTextColor(if (found) 0xFFFFFFFF.toInt() else Ui.TXT_SUB)
+        btnGrab.background = android.graphics.drawable.GradientDrawable().apply {
+            setColor(if (found) Ui.BLUE else Ui.SURFACE_MUTED)
+            cornerRadius = Ui.dp(context, 24f).toFloat()
+        }
+        btnGrab.contentDescription = if (found) "抓资源，发现 $n 个资源" else "抓资源，未发现资源"
+    }
+
+    /** v2.9：底部标签键角标同步 */
+    private fun updateTabButton() {
+        if (!::btnTabs.isInitialized) return
+        val n = tabs.size
+        btnTabs.text = "⊞ $n"
+        btnTabs.contentDescription = "标签管理，当前 $n 个标签"
     }
 
     /** 网页态点击紧凑标题：展开完整地址栏便于输入 */
     private fun expandAddressBar() {
         addressExpanded = true
-        compactTitle.visibility = GONE
+        topChrome.visibility = GONE
         addressBar.visibility = VISIBLE
         etUrl.setText(current?.url?.takeIf { it != HOME_URL }.orEmpty())
         etUrl.requestFocus()
@@ -285,7 +378,7 @@ class BrowserPage(
         addressExpanded = false
         etUrl.clearFocus()
         addressBar.visibility = GONE
-        compactTitle.visibility = if (isWebMode()) VISIBLE else GONE
+        topChrome.visibility = if (isWebMode()) VISIBLE else GONE
     }
 
     /** 是否处于网页浏览态 */
@@ -295,36 +388,38 @@ class BrowserPage(
     }
 
     /**
-     * v2.8 模块二：根据首页/网页态统一切换 chrome（地址栏/紧凑标题/标签条/底部工具栏）。
-     * 首页：完整地址栏 + 标签条 + 隐藏底部工具栏；
-     * 网页态：标签条收起、地址栏默认收起为紧凑标题、显示底部工具栏。
+     * v2.9：根据首页/网页态统一切换 chrome。
+     * 首页：全宽地址栏 + 入口行 + 书签网格，隐藏顶部 chrome 与底部工具栏；
+     * 网页态：顶部进度条 + 紧凑 chrome（标题/抓资源/⋮），底部 5 键工具栏。
+     * 顶部标签条已从视图树移除，此处不再引用 tabsStrip.parent。
      */
     private fun applyChromeMode() {
         val web = isWebMode()
         homepage.visibility = if (web) GONE else VISIBLE
         bottomToolbar.visibility = if (web) VISIBLE else GONE
-        tabsStrip.visibility = if (web) GONE else VISIBLE
-        (tabsStrip.parent as? View)?.visibility = if (web) GONE else VISIBLE
         if (web) {
             if (addressExpanded) {
                 addressBar.visibility = VISIBLE
-                compactTitle.visibility = GONE
+                topChrome.visibility = GONE
             } else {
                 addressBar.visibility = GONE
-                compactTitle.visibility = VISIBLE
+                topChrome.visibility = VISIBLE
                 compactTitle.text = current?.title?.takeIf { it.isNotBlank() }
                     ?: current?.url?.let { it.removePrefix("https://").removePrefix("http://").substringBefore('/') }
                     ?: "网页"
             }
             refreshNavButtons()
+            updateGrabButton(current?.grabCount ?: 0)
+            updateTabButton()
+            updateRefreshButton()
         } else {
             addressExpanded = false
             addressBar.visibility = VISIBLE
-            compactTitle.visibility = GONE
+            topChrome.visibility = GONE
         }
     }
 
-    /** 底部工具栏前进/后退按钮置灰 */
+    /** 底部工具栏前进/后退按钮置灰；收藏/标签键恒可用，不在本方法处理 */
     private fun refreshNavButtons() {
         val wv = current?.webView
         fun dim(tv: TextView, enabled: Boolean) {
@@ -335,15 +430,87 @@ class BrowserPage(
         dim(btnForward, wv?.canGoForward() == true)
     }
 
-    /** v2.8 模块二：多标签管理底部面板（切换/新建/关闭） */
+    /** v2.9：底部标签抽屉（贴底显示，列出全部标签 + 新建/关闭当前/回首页） */
     private fun showTabManager() {
         val ctx = context
-        val names = tabs.map { it.title.ifEmpty { "新标签页" } }.toTypedArray()
-        android.app.AlertDialog.Builder(ctx)
-            .setTitle("标签（${tabs.size}）· 长按项关闭")
-            .setItems(names) { _, which -> switchTo(tabs[which]) }
-            .setPositiveButton("新建标签") { _, _ -> newTab() }
-            .setNeutralButton("关闭当前") { _, _ -> closeTab(current ?: return@setNeutralButton) }
+        var sheet: android.app.AlertDialog? = null
+        val root = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Ui.CARD)
+            setPadding(Ui.dp(ctx, 16f), Ui.dp(ctx, 14f), Ui.dp(ctx, 16f), Ui.dp(ctx, 16f))
+        }
+        root.addView(Ui.text(ctx, "标签（${tabs.size}）", 16f, Ui.TXT, bold = true),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = Ui.dp(ctx, 10f)
+            })
+        val list = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
+        for (t in tabs) {
+            val isSel = t === current
+            val label = t.title.ifEmpty { "新标签页" }
+            val item = TextView(ctx).apply {
+                text = if (isSel) "●  $label" else "○  $label"
+                textSize = 14f
+                gravity = Gravity.CENTER_VERTICAL
+                setTextColor(if (isSel) Ui.BLUE else Ui.TXT)
+                setPadding(Ui.dp(ctx, 12f), Ui.dp(ctx, 10f), Ui.dp(ctx, 12f), Ui.dp(ctx, 10f))
+                minHeight = Ui.dp(ctx, 48f)
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    setColor(if (isSel) Ui.BLUE_LIGHT else Ui.SURFACE_MUTED)
+                    cornerRadius = Ui.dp(ctx, 12f).toFloat()
+                }
+                contentDescription = if (isSel) "当前标签：$label" else "切换到标签：$label"
+                Ui.pressable(this)
+                setOnClickListener { sheet?.dismiss(); switchTo(t) }
+            }
+            list.addView(item, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = Ui.dp(ctx, 6f) })
+        }
+        root.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        val actions = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        val newBtn = Ui.pillBtn(ctx, "新建标签", Ui.BLUE, filled = true) { sheet?.dismiss(); newTab() }.apply {
+            minHeight = Ui.dp(ctx, 48f); contentDescription = "新建标签"
+        }
+        actions.addView(newBtn, LinearLayout.LayoutParams(0, Ui.dp(ctx, 48f), 1f).apply { marginEnd = Ui.dp(ctx, 6f) })
+        val canClose = tabs.size > 1
+        val closeBtn = Ui.pillBtn(ctx, "关闭当前", Ui.RED) { confirmCloseCurrent(sheet) }.apply {
+            minHeight = Ui.dp(ctx, 48f)
+            isEnabled = canClose
+            setTextColor(if (canClose) Ui.RED else Ui.TEXT_DISABLED)
+            contentDescription = if (canClose) "关闭当前标签" else "关闭当前标签（仅剩 1 个标签，不可关闭）"
+        }
+        actions.addView(closeBtn, LinearLayout.LayoutParams(0, Ui.dp(ctx, 48f), 1f).apply { marginEnd = Ui.dp(ctx, 6f) })
+        val homeBtn = Ui.pillBtn(ctx, "回首页", Ui.BLUE) { sheet?.dismiss(); goHome() }.apply {
+            minHeight = Ui.dp(ctx, 48f); contentDescription = "回首页"
+        }
+        actions.addView(homeBtn, LinearLayout.LayoutParams(0, Ui.dp(ctx, 48f), 1f))
+        root.addView(actions, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = Ui.dp(ctx, 12f) })
+
+        sheet = android.app.AlertDialog.Builder(ctx).setView(root).create()
+        sheet?.show()
+        sheet?.window?.apply {
+            setGravity(Gravity.BOTTOM)
+            setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+    }
+
+    /** v2.9：关闭当前标签二次确认；仅剩 1 个标签时禁用并提示 */
+    private fun confirmCloseCurrent(parent: android.app.AlertDialog?) {
+        if (tabs.size <= 1) {
+            Ui.toast(context, "仅剩 1 个标签，无法关闭")
+            return
+        }
+        val label = current?.title?.ifEmpty { "新标签页" } ?: "新标签页"
+        android.app.AlertDialog.Builder(context)
+            .setTitle("关闭当前标签？")
+            .setMessage("将关闭「$label」，该页面的浏览记录会被清除。")
+            .setPositiveButton("关闭") { _, _ ->
+                parent?.dismiss()
+                current?.let { closeTab(it) }
+            }
             .setNegativeButton("取消", null)
             .show()
     }
@@ -372,10 +539,12 @@ class BrowserPage(
                 } catch (e: Exception) { raw ?: "" }
                 val resources = com.swift.download.player.VideoSniff.extractPageResources(text)
                 post {
+                    current?.grabCount = resources.size
                     if (resources.isEmpty()) {
-                        btnGrab.text = "🎬"; Ui.toast(context, "本页未发现可抓取的磁力/种子资源")
+                        updateGrabButton(0)
+                        Ui.toast(context, "本页未发现可抓取的磁力/种子资源")
                     } else {
-                        btnGrab.text = "🎬${resources.size}"
+                        updateGrabButton(resources.size)
                         showResourcePicker(resources)
                     }
                 }
@@ -435,16 +604,32 @@ class BrowserPage(
     /** 宿主（返回键）需要：是否处于网页态；复用内部判定，避免两处逻辑漂移 */
     fun isInWebMode(): Boolean = isWebMode()
 
+    /**
+     * v2.9：宿主返回键统一入口。
+     * 网页态且有历史 → goBack；网页态无历史 → 回首页；首页态 → 返回 false 交给宿主做二次退出确认。
+     */
+    fun handleBack(): Boolean {
+        if (!isWebMode()) return false
+        val wv = current?.webView
+        if (wv?.canGoBack() == true) {
+            wv.goBack()
+            return true
+        }
+        goHome()
+        return true
+    }
+
     /* v2.6.0：宿主生命周期转发，防止退出后网页后台音视频仍在播放 */
     fun onHostPause() { tabs.mapNotNull { it.webView }.forEach { it.onPause() } }
     fun onHostResume() { tabs.mapNotNull { it.webView }.forEach { it.onResume() } }
     fun onHostDestroy() { tabs.mapNotNull { it.webView }.forEach { it.destroy() } }
 
+    /** v2.9：嗅探图标常驻地址栏右侧，仅在有结果时附加数量角标 */
     private fun refreshSniffBadge() {
         val b = sniffBadge ?: return
         val n = current?.sniffed?.size ?: 0
-        b.text = "嗅探($n)"
-        b.visibility = if (n > 0) VISIBLE else GONE
+        b.text = if (n > 0) "嗅探($n)" else "嗅探"
+        b.visibility = VISIBLE
     }
 
     private fun showSniffSheet() {
@@ -498,6 +683,9 @@ class BrowserPage(
 
     fun switchTo(t: Tab) {
         current = t
+        // v2.9：切标签时收起地址编辑态，避免上一个标签的展开状态泄漏到新标签
+        addressExpanded = false
+        isLoading = false
         for (other in tabs) {
             other.webView?.visibility = if (other === t) VISIBLE else GONE
         }
@@ -513,66 +701,12 @@ class BrowserPage(
         applyChromeMode()
     }
 
+    /**
+     * v2.9：顶部标签条已移出视图树，不再填充任何 chip；
+     * 这里只把标签数量同步到底部第 5 键，具体列表在点击时按需构建（底部抽屉）。
+     */
     private fun renderTabs() {
-        tabsStrip.removeAllViews()
-        for (t in tabs) {
-            val isSel = t === current
-            // v2.7 Stage3.2：胶囊 = 标题 + 明显的 × 关闭按钮（× 独立热区，标题区仍可长按关闭）
-            val chip = LinearLayout(context).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(Ui.dp(context, 10f), Ui.dp(context, 5f), Ui.dp(context, 2f), Ui.dp(context, 5f))
-                background = android.graphics.drawable.GradientDrawable().apply {
-                    setColor(if (isSel) Ui.BLUE else 0xFFEDF0F6.toInt())
-                    cornerRadius = Ui.dp(context, 14f).toFloat()
-                }
-                setOnClickListener { switchTo(t) }
-                setOnLongClickListener { closeTab(t); true }
-            }
-            val title = TextView(context).apply {
-                text = t.title.ifEmpty { "新标签页" }
-                textSize = 12f
-                maxLines = 1
-                ellipsize = android.text.TextUtils.TruncateAt.END
-                setTextColor(if (isSel) 0xFFFFFFFF.toInt() else Ui.TXT)
-                typeface = if (isSel) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
-            }
-            chip.addView(title, LinearLayout.LayoutParams(Ui.dp(context, 100f), ViewGroup.LayoutParams.WRAP_CONTENT))
-            val close = TextView(context).apply {
-                text = "×"; textSize = 17f; gravity = Gravity.CENTER
-                setTextColor(if (isSel) 0xFFFFFFFF.toInt() else Ui.TXT_SUB)
-                // 扩大点击热区：24dp 见方，视觉仍是一个字符
-                setPadding(Ui.dp(context, 6f), Ui.dp(context, 6f), Ui.dp(context, 6f), Ui.dp(context, 6f))
-                setOnClickListener { closeTab(t) }
-            }
-            chip.addView(close, LinearLayout.LayoutParams(Ui.dp(context, 30f), Ui.dp(context, 30f)))
-            tabsStrip.addView(chip, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                marginEnd = Ui.dp(context, 6f)
-            })
-        }
-        val plus = TextView(context).apply {
-            text = "＋"
-            textSize = 16f
-            gravity = Gravity.CENTER
-            setTextColor(Ui.BLUE)
-            background = android.graphics.drawable.GradientDrawable().apply {
-                setColor(0xFFEDF0F6.toInt()); cornerRadius = Ui.dp(context, 14f).toFloat()
-            }
-            setOnClickListener { newTab() }
-        }
-        tabsStrip.addView(plus, LinearLayout.LayoutParams(Ui.dp(context, 28f), Ui.dp(context, 28f)))
-        // v2.7 Stage3.2：新增/切换标签后平滑滚动到当前激活胶囊
-        tabsScroller.post {
-            val selIndex = tabs.indexOfFirst { it === current }
-            if (selIndex >= 0) {
-                val child = tabsStrip.getChildAt(selIndex)
-                if (child != null) {
-                    val targetX = (child.left + child.width / 2 - tabsScroller.width / 2)
-                        .coerceAtLeast(0)
-                    tabsScroller.smoothScrollTo(targetX, 0)
-                }
-            }
-        }
+        updateTabButton()
     }
 
     /* ---------------- WebView ---------------- */
@@ -675,6 +809,8 @@ class BrowserPage(
             t.url = url
             t.title = view.title ?: url
             if (t === current) {
+                isLoading = false
+                updateRefreshButton()
                 etUrl.setText(if (url == HOME_URL) "" else url)
                 renderTabs()
                 applyChromeMode()
@@ -745,6 +881,11 @@ class BrowserPage(
         override fun onProgressChanged(view: WebView, newProgress: Int) {
             progress.visibility = if (newProgress in 1..99) VISIBLE else GONE
             progress.progress = newProgress
+            // v2.9：加载中显示 ■ 停止，结束恢复 ↻ 刷新
+            if (t === current) {
+                isLoading = newProgress in 1..99
+                updateRefreshButton()
+            }
         }
         override fun onReceivedTitle(view: WebView, title: String?) {
             t.title = title ?: t.url
@@ -936,10 +1077,12 @@ class BrowserPage(
         }.apply { isDaemon = true }.start()
     }
 
-    /** v2.7 Stage3.2：地址栏 ⋮ 功能菜单（桌面版切换入口） */
+    /** v2.9：网页态顶部 ⋮ 菜单 = 抓资源 / 分享当前链接 / 切换桌面版 / 复制当前网址 */
     private fun showBrowserMenu() {
         val ctx = context
         val items = arrayOf(
+            "抓资源",
+            "分享当前链接",
             if (desktopMode) "切换为手机版网页" else "切换为桌面版网页",
             "复制当前网址"
         )
@@ -947,8 +1090,10 @@ class BrowserPage(
             .setTitle("浏览器功能")
             .setItems(items) { _, which ->
                 when (which) {
-                    0 -> toggleDesktopMode()
-                    1 -> {
+                    0 -> grabPageResources()
+                    1 -> shareCurrentLink()
+                    2 -> toggleDesktopMode()
+                    3 -> {
                         val url = current?.url.orEmpty()
                         if (url.isNotBlank() && url != HOME_URL) copyText("网址", url)
                         else Ui.toast(ctx, "当前页没有可复制的网址")
@@ -957,6 +1102,24 @@ class BrowserPage(
             }
             .setNegativeButton("取消", null)
             .show()
+    }
+
+    /** v2.9：系统分享面板发送当前网址 */
+    private fun shareCurrentLink() {
+        val url = current?.url.orEmpty()
+        if (url.isBlank() || url == HOME_URL) {
+            Ui.toast(context, "当前页没有可分享的网址")
+            return
+        }
+        val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(android.content.Intent.EXTRA_TEXT, url)
+        }
+        try {
+            context.startActivity(android.content.Intent.createChooser(intent, "分享链接"))
+        } catch (e: Exception) {
+            Ui.toast(context, "没有可用的分享应用")
+        }
     }
 
     /** v2.7 Stage3.2：切换 UA 并刷新当前页（解决部分网盘/下载站仅桌面端显示直链） */
@@ -1022,6 +1185,9 @@ class BrowserPage(
     private fun go() {
         val input = etUrl.text.toString().trim()
         if (input.isEmpty()) return
+        // v2.9：先收起展开态，showWeb() 内的 applyChromeMode() 才能正确切到网页态 chrome
+        addressExpanded = false
+        etUrl.clearFocus()
         val t = current ?: newTab()
         when {
             input.startsWith("magnet:") -> confirmMagnet(input)
@@ -1032,11 +1198,9 @@ class BrowserPage(
                 showWeb(t, "https://$input")
             }
             else -> {
-                showWeb(t, "https://www.bing.com/search?q=${java.net.URLEncoder.encode(input, "UTF-8")}")
+                showWeb(t, "https://cn.bing.com/search?q=${java.net.URLEncoder.encode(input, "UTF-8")}")
             }
         }
-        addressExpanded = false
-        etUrl.clearFocus()
     }
 
     /** 打开网页：隐藏首页，并确保当前标签的 WebView 真的可见（可能是从首页返回的旧 WebView） */
@@ -1064,58 +1228,82 @@ class BrowserPage(
         etUrl.setText("")
         t.url = HOME_URL
         t.title = "新标签页"
+        t.grabCount = 0
+        isLoading = false
+        updateRefreshButton()
         renderTabs()
         applyChromeMode()
     }
 
-    /** v2.1：地址栏☆ —— 把当前页收藏为书签（存在则改名） */
-    private fun bookmarkCurrentPage() {
+    /**
+     * v2.9：底部 ☆ —— 居中确认弹窗「是否添加到主页？」
+     * 标题可编辑（预填当前网页标题）+ URL 只读；确定后 upsert 书签并重建首页。
+     */
+    private fun showAddHomeDialog() {
+        val ctx = context
         val t = current ?: return
         val url = t.url
         if (url == HOME_URL || url.isBlank() || !url.startsWith("http")) {
-            Ui.toast(context, "先打开一个网页再收藏")
+            Ui.toast(ctx, "先打开一个网页再收藏")
             return
         }
-        val existing = siteStore.find(url)
-        val initial = QuickSites.Site(existing?.name ?: t.title.ifBlank { url }, url)
-        showSiteEditDialog(context, initial, "收藏书签") { name, newUrl ->
-            siteStore.upsert(existing?.url, name, newUrl)
-            rebuildHomepage()
-            Ui.toast(context, "已收藏 $name（浏览器首页可看到）")
+        val etTitle = Ui.singleLineEt(ctx, "网页标题").apply {
+            setText(t.title.ifBlank { url })
         }
+        val tvUrl = Ui.text(ctx, url, 12f, Ui.TXT_SUB).apply {
+            maxLines = 2
+            ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
+        }
+        val wrap = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(Ui.dp(ctx, 20f), Ui.dp(ctx, 8f), Ui.dp(ctx, 20f), 0)
+            addView(Ui.text(ctx, "标题（可编辑）", 12f, Ui.TXT_SUB))
+            addView(etTitle, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = Ui.dp(ctx, 6f) })
+            addView(Ui.text(ctx, "网址", 12f, Ui.TXT_SUB), LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = Ui.dp(ctx, 12f) })
+            addView(tvUrl, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = Ui.dp(ctx, 6f) })
+        }
+        val dialog = android.app.AlertDialog.Builder(ctx)
+            .setTitle("是否添加到主页？")
+            .setView(wrap)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("确定", null)
+            .create()
+        dialog.setOnShowListener {
+            val ok = dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE)
+            ok.minHeight = Ui.dp(ctx, 48f)
+            ok.setOnClickListener {
+                val name = etTitle.text.toString().trim().ifEmpty { t.title.ifBlank { url } }
+                siteStore.upsert(siteStore.find(url)?.url, name, url)
+                rebuildHomepage()
+                dialog.dismiss()
+                Ui.toast(ctx, "已添加到主页：$name")
+            }
+            dialog.getButton(android.app.AlertDialog.BUTTON_NEGATIVE).minHeight = Ui.dp(ctx, 48f)
+        }
+        dialog.show()
     }
 
     /* ---------------- 首页 ---------------- */
 
     /**
-     * v2.8 模块二：首页极简重塑。
-     * 地址栏本身就是顶部搜索胶囊（首页态常驻），首页内只保留"磁力搜"按钮 + 3 列书签网格，
-     * 删除大段冗余提示文案与多行堆叠。
+     * v2.9：首页极简重塑。顶部地址栏 + 入口行由 init 统一构建并常驻，
+     * 首页内容区只保留 3 列书签网格（卡片高度由自身 minHeight 决定，不再被 84dp 硬压截断）。
      */
     private fun buildHomepage(): View {
         val ctx = context
         val root = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
 
-        // 磁力搜按钮（靠右，紧接顶部地址栏）
-        val magBtn = TextView(ctx).apply {
-            text = "🧲 磁力搜"; textSize = 13f; setTextColor(Ui.BLUE)
-            gravity = Gravity.CENTER
-            setPadding(Ui.dp(ctx, 14f), Ui.dp(ctx, 8f), Ui.dp(ctx, 14f), Ui.dp(ctx, 8f))
-            background = android.graphics.drawable.GradientDrawable().apply {
-                setColor(Ui.BLUE_LIGHT); cornerRadius = Ui.dp(ctx, 18f).toFloat()
-            }
-            Ui.pressable(this)
-            setOnClickListener { onOpenMagnetSearch("") }
-        }
-        root.addView(magBtn, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { gravity = Gravity.END; setMargins(Ui.dp(ctx, 16f), Ui.dp(ctx, 12f), Ui.dp(ctx, 16f), Ui.dp(ctx, 4f)) })
-
-        // 书签区：3 列纯白圆角方块网格（圆形首字母 + 站点名）
+        // 书签区：3 列圆角卡片网格（圆形首字母 + 站点名，最多两行）
         val sitesGrid = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
-        root.addView(sitesGrid, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-            setMargins(Ui.dp(ctx, 14f), Ui.dp(ctx, 6f), Ui.dp(ctx, 14f), Ui.dp(ctx, 20f))
-        })
+        root.addView(sitesGrid, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { setMargins(Ui.dp(ctx, 14f), Ui.dp(ctx, 12f), Ui.dp(ctx, 14f), Ui.dp(ctx, 20f)) })
         renderSites(sitesGrid)
 
         return Ui.verticalScroll(ctx, root)
@@ -1128,23 +1316,18 @@ class BrowserPage(
         val rows = (sites.size + 1 + 2) / 3 // 站点 + 添加卡
         for (r in 0 until rows) {
             val row = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
-            sitesGrid.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                bottomMargin = Ui.dp(ctx, 10f)
-            })
+            sitesGrid.addView(row, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = Ui.dp(ctx, 10f) })
             for (c in 0 until 3) {
                 val i = r * 3 + c
+                // v2.9：高度改 WRAP_CONTENT，卡片自身 minHeight=96dp，两字/三字书名不再被拦腰切掉
+                val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    marginEnd = Ui.dp(ctx, if (c < 2) 10f else 0f)
+                }
                 when {
-                    i < sites.size -> {
-                        val site = sites[i]
-                        row.addView(siteCard(ctx, site), LinearLayout.LayoutParams(0, Ui.dp(ctx, 84f), 1f).apply {
-                            marginEnd = Ui.dp(ctx, if (c < 2) 10f else 0f)
-                        })
-                    }
-                    i == sites.size -> {
-                        row.addView(addSiteCard(ctx), LinearLayout.LayoutParams(0, Ui.dp(ctx, 84f), 1f).apply {
-                            marginEnd = Ui.dp(ctx, if (c < 2) 10f else 0f)
-                        })
-                    }
+                    i < sites.size -> row.addView(siteCard(ctx, sites[i]), lp)
+                    i == sites.size -> row.addView(addSiteCard(ctx), lp)
                 }
             }
         }
@@ -1175,10 +1358,12 @@ class BrowserPage(
     }
 
     private fun siteCard(ctx: Context, site: QuickSites.Site): View {
-        // v2.8 模块二：纯白圆角方块 + 居中圆形首字母 + 名称
+        // v2.9：WRAP_CONTENT + minHeight 96dp + 内容竖向居中，彻底修复「必应/电影港/高清族」被拦腰切掉
         val card = Ui.card(ctx, 16f).apply {
-            gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(Ui.dp(ctx, 8f), Ui.dp(ctx, 14f), Ui.dp(ctx, 8f), Ui.dp(ctx, 12f))
+            gravity = Gravity.CENTER
+            // setMinimumHeight 是 API 1 方法；View.minHeight 属性要 API 29，minSdk 26 不可用
+            setMinimumHeight(Ui.dp(ctx, 96f))
+            setPadding(Ui.dp(ctx, 6f), Ui.dp(ctx, 10f), Ui.dp(ctx, 6f), Ui.dp(ctx, 10f))
         }
         Ui.pressable(card)
         val iv = TextView(ctx).apply {
@@ -1192,12 +1377,12 @@ class BrowserPage(
             }
         }
         card.addView(iv, LinearLayout.LayoutParams(Ui.dp(ctx, 44f), Ui.dp(ctx, 44f)))
-        val nameTv = Ui.text(ctx, site.name, 12f, Ui.TXT, bold = true)
+        val nameTv = Ui.text(ctx, site.name, 13f, Ui.TXT, bold = true)
         nameTv.gravity = Gravity.CENTER
-        nameTv.maxLines = 1
+        nameTv.maxLines = 2
         nameTv.ellipsize = android.text.TextUtils.TruncateAt.END
         card.addView(nameTv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-            topMargin = Ui.dp(ctx, 8f)
+            topMargin = Ui.dp(ctx, 6f)
         })
         card.setOnClickListener {
             val t = current ?: newTab()
@@ -1237,20 +1422,32 @@ class BrowserPage(
     }
 
     private fun addSiteCard(ctx: Context): View {
-        val card = Ui.card(ctx, 14f)
+        // v2.9：与站点卡同高同居中规则，保持 3 列网格视觉齐平
+        val card = Ui.card(ctx, 16f).apply {
+            gravity = Gravity.CENTER
+            // setMinimumHeight 是 API 1 方法；View.minHeight 属性要 API 29，minSdk 26 不可用
+            setMinimumHeight(Ui.dp(ctx, 96f))
+            setPadding(Ui.dp(ctx, 6f), Ui.dp(ctx, 10f), Ui.dp(ctx, 6f), Ui.dp(ctx, 10f))
+        }
+        Ui.pressable(card)
         val iv = TextView(ctx).apply {
             text = "＋"
             textSize = 22f
             gravity = Gravity.CENTER
             setTextColor(Ui.BLUE)
             background = android.graphics.drawable.GradientDrawable().apply {
-                setColor(Ui.BLUE_LIGHT); cornerRadius = Ui.dp(ctx, 12f).toFloat()
+                setColor(Ui.BLUE_LIGHT); cornerRadius = Ui.dp(ctx, 20f).toFloat()
             }
         }
         card.addView(iv, LinearLayout.LayoutParams(Ui.dp(ctx, 40f), Ui.dp(ctx, 40f)))
-        card.addView(Ui.text(ctx, "添加网址", 13f, Ui.TXT, bold = true), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-            topMargin = Ui.dp(ctx, 6f)
-        })
+        val addLabel = Ui.text(ctx, "添加网址", 13f, Ui.TXT, bold = true)
+        addLabel.gravity = Gravity.CENTER
+        addLabel.maxLines = 2
+        addLabel.ellipsize = android.text.TextUtils.TruncateAt.END
+        card.addView(addLabel, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = Ui.dp(ctx, 6f) })
+        card.contentDescription = "添加网址书签"
         card.setOnClickListener { showSiteEditDialog(ctx, null, "添加书签") { n, u ->
             siteStore.add(n, u)
             rebuildHomepage()
@@ -1313,16 +1510,16 @@ class QuickSites private constructor(private val ctx: Context) {
     private val file: File get() = File(ctx.filesDir, "quick_sites.json")
 
     private val defaults = listOf(
-        Site("必应", "https://www.bing.com"),
+        // v2.9：修正默认书签域名（国内可直连的 cn 节点）
+        Site("必应", "https://cn.bing.com"),
         Site("电影港", "https://www.dygang.cc"),
         // v2.8 模块二：更新失效域名（高清族换新域，移除长期打不开的 SHB）
         Site("高清族", "https://hdzu.cc"),
-        Site("磁力搜", "https://www.bing.com/search?q=magnet")
+        Site("磁力搜", "https://cn.bing.com/search?q=magnet")
     )
 
     fun all(): List<Site> {
-        if (!file.exists()) return defaults
-        return try {
+        val loaded = if (!file.exists()) defaults else try {
             val arr = JSONArray(file.readText())
             (0 until arr.length()).map {
                 val o = arr.getJSONObject(it)
@@ -1331,6 +1528,15 @@ class QuickSites private constructor(private val ctx: Context) {
         } catch (e: Exception) {
             defaults
         }
+        // v2.9.0：老版本持久化书签里的失效域名就地纠正，用户无需手动重加
+        return loaded.map { normalizeDefaultDomain(it) }
+    }
+
+    private fun normalizeDefaultDomain(site: Site): Site = when (site.name) {
+        "必应" -> if (site.url.contains("bing.com")) defaults[0] else site
+        "电影港" -> if (site.url.contains("dygang")) defaults[1] else site
+        "高清族" -> if (site.url.contains("hdzu") || site.url.contains("gaoqingzu")) defaults[2] else site
+        else -> site
     }
 
     fun add(name: String, url: String) {

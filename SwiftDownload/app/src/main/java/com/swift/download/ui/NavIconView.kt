@@ -14,7 +14,7 @@ import kotlin.math.min
  * 全部使用 API 1 即有的 Canvas 基础绘制（drawCircle/drawLine/drawArc），
  * 不引入任何新依赖；通过 [setTint] 与激活态联动改色。
  *
- * @param kind 0=浏览器（圆+横线） 1=传输（双向箭头） 2=文件（文件夹轮廓） 3=我的（圆头+肩弧）
+ * @param kind 0=浏览器（指南针：外圆 + 菱形罗盘针） 1=传输（双向箭头） 2=文件（文件夹轮廓） 3=我的（圆头+肩弧）
  */
 @SuppressLint("ViewConstructor")
 class NavIconView(
@@ -60,9 +60,20 @@ class NavIconView(
 
         when (iconKind) {
             0 -> {
-                // 浏览器：外圆 + 赤道横线
+                // 浏览器 v2.9：指南针（外圆 + 菱形罗盘针 + 北向指针），
+                // 替代原「圆+横线」被看成 ⊖ 禁止符的问题；24dp / 2dp stroke / tint 机制不变。
                 canvas.drawCircle(cx, cy, r, paint)
-                canvas.drawLine(cx - r, cy, cx + r, cy, paint)
+                val top = cy - r * 0.74f
+                val bottom = cy + r * 0.74f
+                val left = cx - r * 0.46f
+                val right = cx + r * 0.46f
+                canvas.drawLines(floatArrayOf(
+                    cx, top, right, cy,
+                    right, cy, cx, bottom,
+                    cx, bottom, left, cy,
+                    left, cy, cx, top
+                ), paint)
+                canvas.drawLine(cx, cy, cx, top, paint)
             }
             1 -> {
                 // 传输：一条竖线 + 上下箭头

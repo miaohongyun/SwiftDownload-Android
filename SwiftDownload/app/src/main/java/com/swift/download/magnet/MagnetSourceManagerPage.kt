@@ -107,7 +107,14 @@ class MagnetSourceManagerPage(context: Context) : FrameLayout(context) {
         val card = Ui.card(ctx)
         val line = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         val col = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
-        col.addView(Ui.text(ctx, src.name, 15f, Ui.TXT, bold = true))
+        val titleRow = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        titleRow.addView(Ui.text(ctx, src.name, 15f, Ui.TXT, bold = true))
+        if (src.proxyRequired) {
+            titleRow.addView(Ui.text(ctx, "需代理", 10f, Ui.ORANGE, bold = true), LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginStart = Ui.dp(ctx, 8f) })
+        }
+        col.addView(titleRow)
         val url = Ui.text(ctx, src.searchUrl, 12f, Ui.TXT_SUB)
         url.maxLines = 1
         url.ellipsize = android.text.TextUtils.TruncateAt.MIDDLE

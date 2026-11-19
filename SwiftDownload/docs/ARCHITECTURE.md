@@ -419,3 +419,42 @@ init 里构建筛选胶囊时 `labelOf()` → `TaskFilters.counts(lastTasks)` �
   `SourceLayoutGuardTest` 全程守护「属性必须在 init 前」铁律。
 - 纯逻辑零依赖：`MagnetSourceRules` 手写 JSON 编解码规避 org.json JVM stub，
   与 v2.7 的 `BackupCodec` 同一设计取向。
+
+# v2.9.0 架构增量（BT 引擎升级 + 单手交互重做）
+
+## BT 依赖与 API 适配
+
+- `jlibtorrent 1.2.0.18`（2018）→ FrostWire `jlibtorrent-android 2.1.2.1`（libtorrent 2.x）。
+  旧版默认绑定 `NETLINK_ROUTE` 枚举网卡，Android 11+ 被 SELinux 拦截，DHT/tracker 全失效；
+  新版 AAR 自带 arm64/arm .so 与 R8 规则，`minSdk` 提升到 26，`abiFilters` 只留两种 arm 架构。
+- `TorrentEngine` 2.x API 差异：`SettingsPack.setEnableDht/setEnableLsd`、`maxQueuedDiskBytes`、
+  `setDhtBootstrapNodes`；magnet `download(uri, dir, torrent_flags_t())`；
+  `MetadataReceivedAlert` 不再有 `torrentData()`，改从 `handle().torrentFile()` 取元数据；
+  `Sha1Hash` 仍可 `find`，`.torrent` 取 hash 改 `infoHashV1()/V2()`；移除 2.x 已删除的 `State.ALLOCATING`。
+- `listenInterfaces = "0.0.0.0:0,[::]:0"`：5G IPv6 优先场景必须双栈监听。
+- `PublicTrackers.TRACKERS` 扩至 27 个 HTTP/HTTPS/UDP 混合列表；
+  磁力 URI 通过查询参数注入，`.torrent` 通过 `TorrentHandle.addTracker` 注入。
+- 诊断链路：`TorrentEngine.BtProgress` 增 `trackerCount` → `DownloadService.BtDiag` → `TransfersPage`
+  独立等宽诊断行；0 值也展示，避免「0 B/s 黑盒」。
+
+## 浏览器单手 chrome
+
+- `BrowserPage` 顶层视图顺序：3dp 进度条 → 首页地址栏 / 网页态 topChrome → contentHost → 底部 5 键工具栏。
+  顶部标签条（`tabsStrip/tabsScroller`）从视图树移除，多标签改由 `showTabManager()` 底部抽屉承载。
+- `handleBack()` 作为网页态返回唯一入口（有历史 goBack / 无历史 goHome），
+  `MainActivity.onBackPressed()` 只负责首页二次退出确认。
+- `siteCard` 高度 `WRAP_CONTENT + minHeight 96dp`，标题最多两行，消除固定 84dp 造成的文字截断。
+- `NavIconView` kind=0 改为指南针几何绘制，避免「圆+横线」被误认为禁止符。
+
+## 磁力可达性
+
+- `SiteDirectSearch`（纯 Kotlin）负责影视站模板校验/URL 拼接/内置+自定义合并/超时引导文案；
+  `MagnetSearchPage` 通过 `initialSiteMode` 支持浏览器「影视站搜（免代理）」直达，
+  点站点卡片回调 `onOpenSite` 在浏览器打开详情页。
+- `MagnetSource.proxyRequired` 标记境外源，源管理页显著标注；默认源移除三个长期失效域名。
+- `QuickSites.all()` 就地迁移旧持久化书签里的失效域名，无需用户手动重加。
+
+## 测试策略增量
+
+- 单测 200 → 209：新增 `V29RegressionTest`（9 个纯 JVM 用例）覆盖混合 tracker、诊断字段、
+  死源清理、模板解析/覆盖、超时文案；`SourceLayoutGuardTest` 继续守卫 init 前成员声明。

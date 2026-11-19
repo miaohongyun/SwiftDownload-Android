@@ -1,7 +1,7 @@
 package com.swift.download.bt
 
 import android.util.Log
-import com.frostwire.jlibtorrent.AddTorrentParams
+import com.frostwire.jlibtorrent.AnnounceEntry
 import com.frostwire.jlibtorrent.Priority
 import com.frostwire.jlibtorrent.Sha1Hash
 import com.frostwire.jlibtorrent.TorrentFlags
@@ -14,6 +14,7 @@ import com.frostwire.jlibtorrent.alerts.MetadataReceivedAlert
 import com.frostwire.jlibtorrent.alerts.TorrentAlert
 import com.frostwire.jlibtorrent.alerts.TorrentFinishedAlert
 import com.frostwire.jlibtorrent.swig.settings_pack
+import com.frostwire.jlibtorrent.swig.torrent_flags_t
 import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -21,7 +22,9 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 
 /**
- * v2.0 新增：BT/磁力下载引擎（jlibtorrent 1.2.0.18 封装）。
+ * v2.9.0：BT/磁力下载引擎（FrostWire jlibtorrent 2.1.2.1 / libtorrent 2.x）。
+ * 旧 1.2.0.18 在 Android 11+ 因 NETLINK_ROUTE 被 SELinux 拦截而枚举不到网卡，
+ * DHT/tracker 全部失效；新版本修复该问题。
  *  - 元数据优先：addMagnet 先 fetchMagnet 拿元数据回填任务名/大小，再开始下载
  *  - 轮询式进度：progressOf() 由 DownloadService 的 ticker 调用（与 HTTP 引擎同一通知体系）
  */
@@ -109,19 +112,19 @@ class TorrentEngine private constructor() {
             sp.connectionsLimit(MAX_CONNECTIONS)
             sp.downloadRateLimit(0)   // 不限速
             sp.uploadRateLimit(0)
-            sp.cacheSize(CACHE_SIZE_MB)
-            // v2.8 模块一：DHT/LSD/UPnP/NAT-PMP 全开 + 公共引导节点
-            sp.enableDht(true)
-            sp.setBoolean(settings_pack.bool_types.enable_dht.swigValue(), true)
-            sp.setBoolean(settings_pack.bool_types.enable_lsd.swigValue(), true)
-            sp.broadcastLSD(true)
+            // libtorrent 2.x 移除了 cacheSize()，磁盘写队列以字节计
+            sp.maxQueuedDiskBytes(CACHE_SIZE_MB * 1024 * 1024)
+            // v2.9.0：DHT/LSD/UPnP/NAT-PMP 全开 + 公共引导节点 + 全协议 announce
+            sp.setEnableDht(true)
+            sp.setEnableLsd(true)
             sp.setBoolean(settings_pack.bool_types.enable_upnp.swigValue(), true)
             sp.setBoolean(settings_pack.bool_types.enable_natpmp.swigValue(), true)
             // 向所有 tracker/tier 并发宣告，冷门资源寻源关键
             sp.setBoolean(settings_pack.bool_types.announce_to_all_trackers.swigValue(), true)
             sp.setBoolean(settings_pack.bool_types.announce_to_all_tiers.swigValue(), true)
-            sp.setString(settings_pack.string_types.dht_bootstrap_nodes.swigValue(), DHT_BOOTSTRAP)
-            sp.listenInterfaces("0.0.0.0:0")
+            sp.setDhtBootstrapNodes(DHT_BOOTSTRAP)
+            // 5G 移动网络 IPv6 优先：必须同时监听 v4/v6，否则只监听 v4 时节点不可达
+            sp.listenInterfaces("0.0.0.0:0,[::]:0")
             // v2.7 Stage2.1：应用代理与上传限速（默认配置=无代理不限速，行为不变）
             applyProxyAndRate(sp, netConfig)
             session.start(SessionParams(sp))
@@ -159,7 +162,8 @@ class TorrentEngine private constructor() {
         io.execute {
             ensureStarted()
             try {
-                session.download(magnetUri, saveDir)
+                // libtorrent 2.x：magnet 下载重载必须显式传 torrent_flags_t（默认空标志）
+                session.download(magnetUri, saveDir, torrent_flags_t())
             } catch (e: Exception) {
                 Log.w(TAG, "addMagnet", e)
                 fireError(hash, "添加 BT 任务失败：${e.message ?: "未知错误"}")
@@ -190,9 +194,30 @@ class TorrentEngine private constructor() {
         return try {
             val ti = TorrentInfo(torrentFile)
             session.download(ti, saveDir)
-            ti.infoHash().toHex()
+            val hash = ti.infoHashV1().toHex()
+            val hex = if (hash.all { it == '0' }) ti.infoHashV2().toHex() else hash
+            // .torrent 自带 tracker 通常很少，补内置 HTTP/HTTPS/UDP 高可用列表（5G 下 UDP 常被丢弃）
+            addPublicTrackers(hex)
+            hex
         } catch (e: Exception) {
             Log.w(TAG, "addTorrentFile", e); null
+        }
+    }
+
+    /**
+     * v2.9.0：给已添加的种子补内置 tracker。
+     * 磁力 URI 走 [PublicTrackers.appendToMagnet]；.torrent 文件自带 tracker 数少，
+     * 这里通过 handle.addTracker 补齐，避免国内 5G 下裸 UDP 不可达导致 0 节点。
+     */
+    private fun addPublicTrackers(hash: String) {
+        val h = try { find(hash) } catch (e: Exception) { null } ?: return
+        try {
+            val existing = h.trackers().mapNotNull { it.url() }.toHashSet()
+            for (url in PublicTrackers.TRACKERS) {
+                if (existing.add(url)) h.addTracker(AnnounceEntry(url))
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "addPublicTrackers", e)
         }
     }
 
@@ -217,8 +242,9 @@ class TorrentEngine private constructor() {
                 com.frostwire.jlibtorrent.TorrentStatus.State.DOWNLOADING_METADATA -> "获取元数据中"
                 com.frostwire.jlibtorrent.TorrentStatus.State.DOWNLOADING -> "下载中"
                 com.frostwire.jlibtorrent.TorrentStatus.State.SEEDING -> "做种中"
+                com.frostwire.jlibtorrent.TorrentStatus.State.FINISHED -> "已完成"
                 com.frostwire.jlibtorrent.TorrentStatus.State.CHECKING_FILES -> "校验文件"
-                com.frostwire.jlibtorrent.TorrentStatus.State.ALLOCATING -> "分配磁盘空间"
+                com.frostwire.jlibtorrent.TorrentStatus.State.CHECKING_RESUME_DATA -> "校验断点数据"
                 else -> "连接节点中"
             }
         }
@@ -235,6 +261,8 @@ class TorrentEngine private constructor() {
             }
         } catch (e: Exception) { "" }
         val dhtNodes = try { session.dhtNodes() } catch (e: Exception) { 0L }
+        // v2.9.0：Tracker 命中数（含内置追加的 HTTP/HTTPS/UDP tracker），0 也要如实显示
+        val trackerCount = try { h.trackers().size } catch (e: Exception) { 0 }
         return BtProgress(
             downloaded = st.totalWantedDone(),
             total = st.totalWanted(),
@@ -245,6 +273,7 @@ class TorrentEngine private constructor() {
             finished = st.isFinished,
             name = try { h.name() } catch (e: Exception) { "" },
             dhtNodes = dhtNodes,
+            trackerCount = trackerCount,
             stateLabel = stateLabel,
             trackerError = trackerError
         )
@@ -446,6 +475,7 @@ class TorrentEngine private constructor() {
         val finished: Boolean,
         val name: String,
         val dhtNodes: Long = 0,
+        val trackerCount: Int = 0,
         val stateLabel: String = "",
         val trackerError: String = ""
     )
@@ -468,17 +498,19 @@ class TorrentEngine private constructor() {
         override fun alert(a: com.frostwire.jlibtorrent.alerts.Alert<*>) {
             when (a) {
                 is MetadataReceivedAlert -> {
-                    val hex = a.handle().infoHash().toHex()
+                    val handle = a.handle()
+                    val hex = handle.infoHash().toHex()
                     onMetadataArrived(hex)
-                    val data: ByteArray? = a.torrentData()
-                    if (data != null && data.isNotEmpty()) {
-                        try {
-                            val ti = TorrentInfo(data)
-                            fireMetadata(hex, ti.name(), ti.totalSize(), ti.numFiles())
-                        } catch (e: Exception) {
-                            Log.w(TAG, "meta alert", e)
-                        }
+                    // libtorrent 2.x 的 metadata_received_alert 不再暴露 torrentData()；
+                    // 元数据已落到 handle 上，直接取 torrentFile()
+                    try {
+                        val ti = handle.torrentFile()
+                        if (ti != null) fireMetadata(hex, ti.name(), ti.totalSize(), ti.numFiles())
+                    } catch (e: Exception) {
+                        Log.w(TAG, "meta alert", e)
                     }
+                    // 冷门种子补 tracker，提升后续找源概率
+                    addPublicTrackers(hex)
                 }
                 is TorrentFinishedAlert -> {
                     val hex = (a as TorrentAlert<*>).handle().infoHash().toHex()

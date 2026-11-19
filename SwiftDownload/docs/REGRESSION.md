@@ -429,3 +429,30 @@ E2E-A 的 `.part` 残留并非断言写错：`segDone()` 在 `RandomAccessFile` 
 - BT 磁力任务能否冲破 0 B/s（DHT 节点连接 + 元数据到达）。
 - 浏览器底部工具栏与代理开关是否生效、`.torrent` 链接是否直接建 BT 任务。
 - 一键抓资源在电影港/高清族等站点的命中率；离屏兜底对被拦截源的实际改善。
+
+# v2.9.0 增量回归（BT 升级 + 单手交互重做）
+
+## 真机问题对照
+
+| 真机现象 | 根因 | 修复 |
+| --- | --- | --- |
+| 磁力任务长期「准备就绪（等待元数据…）· 连接节点 · 0 B」 | jlibtorrent 1.2.0.18 的 `NETLINK_ROUTE` 在 Android 11+ 被 SELinux 拦截；且只监听 IPv4、tracker 以 UDP 为主 | 升级 libtorrent 2.x AAR；双栈监听；HTTP/HTTPS/UDP 混合 27 tracker；DHT 全开 |
+| 浏览器首页书签标题被拦腰截断 | `siteCard` 固定 84dp 高度 + 标题单行 | `WRAP_CONTENT + minHeight 96dp`、最多两行 |
+| 底部「浏览器」图标像禁止符号 | `NavIconView` kind=0 画「圆+横线」 | 改为指南针矢量绘制 |
+| 顶部堆叠标签条与六个按钮、几乎无法单手操作 | v2.8 布局仍是桌面式 | 顶部只保留地址框；网页态顶部胶囊 + 底部 5 等分拇指键；标签管理移到底部抽屉 |
+| 磁力搜索五个源全部超时 | 3 个默认域名已死，另外 2 个需境外代理 | 删除死源、标注需代理、新增影视站直搜（免代理）模式 |
+
+## 门禁
+
+1. 版本升至 `versionCode 14 / versionName 2.9.0`，`minSdk` 24 → 26。
+2. 三道门禁：`testDebugUnitTest` 209 通过；`lintDebug` 0 Error；`assembleRelease` 成功。
+3. APK 核验：`versionCode=14`、`versionName=2.9.0`、`minSdk=26`、
+   `native-code: arm64-v8a / armeabi-v7a`，`libjlibtorrent.so` 为 2.1.2.1 新版，
+   v2 签名验证通过。
+
+## 待真机验证项
+
+- 小米 14 Pro（Android 14+/5G）BT 磁力能否出元数据并开始下载；诊断行 DHT/Tracker/节点数是否实时变化。
+- 影视站直搜：高清族/电影港站内搜索能否打开详情页；「抓资源」能否提取到 magnet。
+- 单手操作：底部 5 键热区、标签抽屉、收藏弹窗、返回键行为是否符合拇指操作习惯。
+- 若用户曾开启 HTTP 代理，影视站直搜是否仍可直连（当前 WebView 代理为进程级全局，需用户手动关闭代理）。

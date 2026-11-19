@@ -7,8 +7,13 @@ package com.swift.download.bt
  */
 object PublicTrackers {
 
-    /** 内置 tracker（约 18 个），按协议分散，避免单一协议失效 */
+    /**
+     * v2.9.0：HTTP / HTTPS / UDP 混合高可用 tracker（约 30 个）。
+     * 国内运营商 5G 普遍丢弃/限流 UDP，因此必须同时带 http(s) tracker，
+     * 否则裸磁力在移动网络下 DHT 有节点也 announce 不出去。
+     */
     val TRACKERS: List<String> = listOf(
+        // UDP：节点多、延迟低，Wi-Fi 下表现最好
         "udp://tracker.opentrackr.org:1337/announce",
         "udp://open.stealth.si:80/announce",
         "udp://tracker.torrent.eu.org:451/announce",
@@ -19,6 +24,7 @@ object PublicTrackers {
         "udp://tracker-udp.gbitt.info:80/announce",
         "udp://tracker.leechangel.free.fr:81/announce",
         "udp://open.demonii.com:1337/announce",
+        // HTTPS：5G 可达性最好，优先保证
         "https://tracker.opentrackr.org:1337/announce",
         "https://tracker.torrent.eu.org:451/announce",
         "https://tracker.bittor.pw:1337/announce",
@@ -26,6 +32,16 @@ object PublicTrackers {
         "https://tracker.novg.net:1337/announce",
         "https://tracker.moeking.me:6969/announce",
         "https://tracker.yemekyedim.com:6969/announce",
+        "https://tracker.hdcmct.com:2710/announce",
+        "https://tracker.0x.tf:6969/announce",
+        "https://tracker.lilithraws.org:6969/announce",
+        // HTTP：部分老客户端/运营商 HTTPS SNI 受阻时的兜底
+        "http://tracker.openbittorrent.com:80/announce",
+        "http://tracker.opentrackr.org:1337/announce",
+        "http://bttrack.9apps.net:26971/announce",
+        "http://tracker.internetwars.ru:2641/announce.php",
+        "http://tracker.tiny-vps.com:6969/announce",
+        "http://t.nyaatracker.com:80/announce",
         "wss://tracker.openwebtorrent.com"
     )
 

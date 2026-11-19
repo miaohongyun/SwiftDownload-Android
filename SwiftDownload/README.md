@@ -4,7 +4,7 @@ Android 下载工具：多线程 HTTP、断点续传、内置浏览器与视频�
 BT 选文件、边下边播、DLNA 投屏、局域网投递、文件哈希校验。Kotlin + 原生 jlibtorrent，
 无第三方 UI / 网络框架。
 
-当前版本：**v2.8.0**（versionCode 13）。共 **200 个 JVM 单元测试，200/200 通过**。
+当前版本：**v2.9.0**（versionCode 14）。共 **209 个 JVM 单元测试，209/209 通过**。
 
 ## 文档
 
@@ -62,7 +62,7 @@ SwiftDownload/
 │   │   ├── remote/                            # 局域网 Web 投递面板
 │   │   ├── settings/                          # 设置 / 规则 / 重试 / 备份编解码与恢复
 │   │   └── ui/                                # 代码构建 UI 助手
-│   └── src/test/                              # 200 个 JVM 单元测试
+│   └── src/test/                              # 209 个 JVM 单元测试
 ├── docs/                                      # 用户手册 / 架构 / 变更 / 回归
 ├── keystore/swiftdl.jks                       # 自签发布密钥（自用）
 └── scripts/build.sh                           # 测试 + Release 一键构建
@@ -70,7 +70,7 @@ SwiftDownload/
 
 ## 构建
 
-环境：JDK 17、Gradle 8.9、AGP 8.5.2、Kotlin 1.9.24、compileSdk 36、minSdk 24。
+环境：JDK 17、Gradle 8.9、AGP 8.5.2、Kotlin 1.9.24、compileSdk 36、minSdk 26（v2.9.0 起）。
 
 ```bash
 # 全部测试 + Release APK
@@ -83,6 +83,9 @@ SwiftDownload/
 ```
 
 - `settings.gradle.kts` 已配置阿里云 Maven 镜像，wrapper 使用腾讯镜像分发源。
+- v2.9.0 的 `com.frostwire:jlibtorrent-android:2.1.2.1` 来自 FrostWire 官方仓库，
+  AAR 实体托管在 GitHub Release；国内网络不可达时可通过镜像预取到
+  `~/.m2/repository/com/frostwire/jlibtorrent-android/2.1.2.1/`（构建已优先读取 `mavenLocal()`）。
 - 签名：`keystore/swiftdl.jks`，alias `swiftdl`。**私钥与口令随源码存放，仅适合自用**；
   对外发布前必须轮换并改用环境变量/本机凭据。
 
@@ -92,7 +95,7 @@ SwiftDownload/
 ./gradlew testDebugUnitTest
 ```
 
-当前 **200 个 JVM 用例，200/200 通过**（v2.5.3 的 90 → v2.6.0 的 139 → v2.7.0 的 184 → v2.8.0 的 200）。覆盖：
+当前 **209 个 JVM 用例，209/209 通过**（v2.5.3 的 90 → v2.6.0 的 139 → v2.7.0 的 184 → v2.8.0 的 200 → v2.9.0 的 209）。覆盖：
 
 - 下载完整性：正常分段 / 忽略 Range / 短响应 / 错误 Content-Range / 404 错误页 / Chunked 无长度 / Cookie 校验；
 - 网络：跨端口 302 重定向、finalUrl 分段复用；
@@ -146,6 +149,7 @@ v2.5.2 之前，异常服务器响应可能让不完整或错位的文件被标�
 | 版本 | 主题 |
 | --- | --- |
 | v2.8.0 | 真实用性重构：BT 会话死锁修复+DHT穿透+诊断透出、浏览器单手工具栏+极简首页+代理/SSL修复、广告 DOM 注入、磁力源管理+离屏兜底+一键抓资源 |
+| v2.9.0 | 升级 jlibtorrent 2.1.2.1 修复 Android 11+ BT 不可达；浏览器重做为拇指单手布局（无顶部标签条/六按钮，底部五键）；磁力源清理 + 影视站直搜（免代理） |
 | v2.7.0 | 五阶段体验升级：刷新保留断点/自动重试/空间校验/任务详情、BT 代理停种 Tracker+按需边播+fMP4/TS 封装、浏览器净化+细节+批量建任务、Edge-to-Edge+筛选+ZIP/文本工具+备份 |
 | v2.6.0 | 并发/网络/引擎/交互四阶段升级：Work Stealing、HLS AES、Cookie、MediaStore、局域网投递 |
 | v2.5.3 | 代码清理 + 文档完善 |

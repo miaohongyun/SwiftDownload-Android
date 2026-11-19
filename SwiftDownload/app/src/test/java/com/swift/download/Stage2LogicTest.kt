@@ -45,7 +45,8 @@ class Stage2LogicTest {
     fun trackerAppend() {
         val t = PublicTrackers.appendToMagnet("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567")
         assertTrue(t.contains("tr="))
-        assertTrue(PublicTrackers.TRACKERS.size in 15..25)
+        // v2.9.0：HTTP/HTTPS/UDP 混合列表扩到 27 个，5G 下不能只有裸 UDP
+        assertTrue(PublicTrackers.TRACKERS.size in 25..40)
         // 40 位 hex 自动补 magnet 前缀并加 tracker
         val fromHash = PublicTrackers.appendToMagnet("0123456789abcdef0123456789abcdef01234567")
         assertTrue(fromHash.startsWith("magnet:?xt=urn:btih:"))

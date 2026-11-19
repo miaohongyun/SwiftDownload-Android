@@ -24,7 +24,9 @@ class MagnetSourceStore private constructor(private val ctx: Context) {
                     id = def.id, name = def.name,
                     searchUrl = ov.optString("searchUrl", def.searchUrl).ifBlank { def.searchUrl },
                     parser = def.parser,
-                    enabled = ov.optBoolean("enabled", def.enabled)
+                    enabled = ov.optBoolean("enabled", def.enabled),
+                    // v2.9.0：覆盖地址/开关时保留「需代理」标注，避免老配置丢失标签
+                    proxyRequired = def.proxyRequired
                 )
             } else def.copy()
         }

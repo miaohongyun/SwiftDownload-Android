@@ -707,17 +707,13 @@ class TransfersPage(
                         append(" · 剩余 ").append(Format.eta((t.totalBytes - t.downloadedBytes) / spd))
                     }
                 }
-                // v2.8 模块一：BT 真实连接状态，让用户区分"连节点中"与"真没资源"
+                // v2.9.0：状态标签保留简短文案，真实连接数字改到独立诊断行（0 值也必须显示）
                 if (t.isBt && (st == DownloadTask.Status.PROBING || st == DownloadTask.Status.RUNNING)) {
                     val diag = controller.btDiagnostics(t.id)
                     if (diag != null) {
                         val label = if (diag.stateLabel.isNotBlank()) diag.stateLabel
                                     else if (st == DownloadTask.Status.PROBING) "等待元数据" else "下载中"
                         append(" · ").append(label)
-                        if (diag.dhtNodes > 0 || diag.peers > 0) {
-                            append(" · DHT ").append(diag.dhtNodes).append(" / 节点 ").append(diag.peers)
-                        }
-                        if (diag.seeds > 0) append(" · 做种 ").append(diag.seeds)
                     } else if (st == DownloadTask.Status.PROBING) {
                         append(" · 正在连接 DHT 网络…")
                     }
@@ -737,6 +733,24 @@ class TransfersPage(
             card.addView(Ui.numericText(ctx, statusText, 13f, statusColor(st)),
                 LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
                     .apply { topMargin = Ui.dp(ctx, 6f) })
+
+            // v2.9.0：BT 真实连接诊断行 —— 告别黑盒，0 也如实展示
+            if (t.isBt && (st == DownloadTask.Status.PROBING || st == DownloadTask.Status.RUNNING)) {
+                val diag = controller.btDiagnostics(t.id)
+                val diagText = if (diag == null) {
+                    "等待元数据 · DHT节点 0 · Tracker 0 · 已连节点 0 · 正在初始化 BT 引擎"
+                } else buildString {
+                    append(if (st == DownloadTask.Status.PROBING) "等待元数据" else "下载中")
+                    append(" · DHT节点 ").append(diag.dhtNodes)
+                    append(" · Tracker ").append(diag.trackerCount)
+                    append(" · 已连节点 ").append(diag.peers)
+                    if (diag.seeds > 0) append(" · 做种 ").append(diag.seeds)
+                    if (diag.trackerError.isNotBlank()) append(" · ").append(diag.trackerError)
+                }
+                card.addView(Ui.numericText(ctx, diagText, 12f, Ui.TXT_SUB),
+                    LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                        .apply { topMargin = Ui.dp(ctx, 3f) })
+            }
 
             // 体积行（v2.2：带百分比）
             val pct = if (t.totalBytes > 0) " · %.1f%%".format(t.downloadedBytes * 100.0 / t.totalBytes) else ""
@@ -977,6 +991,8 @@ class TransfersPage(
                 // v2.8 模块一：BT 诊断细节（DHT 节点 / 状态 / tracker 错误）
                 controller.btDiagnostics(t.id)?.let { d ->
                     row("DHT 节点", d.dhtNodes.toString())
+                    row("Tracker", d.trackerCount.toString())
+                    row("已连节点", d.peers.toString())
                     if (d.stateLabel.isNotBlank()) row("连接状态", d.stateLabel)
                     if (d.trackerError.isNotBlank()) row("Tracker", d.trackerError)
                 }

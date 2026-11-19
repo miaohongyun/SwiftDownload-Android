@@ -28,11 +28,21 @@ import kotlinx.coroutines.withContext
 @SuppressLint("ViewConstructor")
 class MagnetSearchPage(
     context: Context,
-    private val onDownload: (magnetUri: String) -> Unit
+    private val onDownload: (magnetUri: String) -> Unit,
+    /** v2.9.0：影视站直搜命中站点后交给宿主在浏览器打开详情页 */
+    private val onOpenSite: (url: String) -> Unit = { _ -> },
+    /** v2.9.0：浏览器「影视站搜（免代理）」入口直接以站点直搜模式打开 */
+    private val initialSiteMode: Boolean = false
 ) : FrameLayout(context) {
 
     private val store = MagnetSourceStore.get(context)
     private val scope = CoroutineScope(Dispatchers.Main + kotlinx.coroutines.SupervisorJob())
+    /** v2.9.0：false=全网磁力索引（需代理），true=影视站直搜（国内 5G 免代理） */
+    private var siteMode = initialSiteMode
+    private val sitePrefs = context.getSharedPreferences("site_direct_search", Context.MODE_PRIVATE)
+    private lateinit var modeRow: LinearLayout
+    private lateinit var siteList: LinearLayout
+    private val settings = com.swift.download.settings.DownloadSettings.get(context)
 
     private val etKeyword: EditText
     private val tvStatus: TextView
@@ -75,6 +85,21 @@ class MagnetSearchPage(
         searchRow.addView(btn, LinearLayout.LayoutParams(Ui.dp(context, 88f), Ui.dp(context, 48f)))
         header.addView(searchRow)
 
+        // v2.9.0：双模式切换 —— 全网索引（境外源需代理） / 影视站直搜（国内 5G 免代理）
+        modeRow = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+        header.addView(modeRow, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = Ui.dp(context, 10f) })
+        renderModeChips()
+
+        siteList = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+        header.addView(siteList, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = Ui.dp(context, 8f) })
+
         tvStatus = Ui.text(context, "聚合 ${store.enabled().size} 个磁力源 · 点结果开始下载", 12f, Ui.TXT_SUB)
         header.addView(tvStatus, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
             setMargins(Ui.dp(context, 4f), Ui.dp(context, 10f), Ui.dp(context, 4f), Ui.dp(context, 6f))
@@ -113,6 +138,12 @@ class MagnetSearchPage(
         root.addView(rv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         root.addView(emptyView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         addView(root, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        if (siteMode) {
+            rv.visibility = View.GONE
+            siteList.visibility = View.VISIBLE
+            tvStatus.text = "国内影视站免代理直搜 · 打开详情页后点「抓资源」提取磁力"
+            renderSiteCards("")
+        }
     }
 
     fun prefillKeyword(kw: String) {
@@ -120,9 +151,111 @@ class MagnetSearchPage(
         doSearch()
     }
 
+    /* ---------------- v2.9.0：全网索引 / 影视站直搜双模式 ---------------- */
+
+    private fun renderModeChips() {
+        modeRow.removeAllViews()
+        val a = Ui.chip(context, "全网磁力索引", !siteMode) { setMode(false) }
+        val b = Ui.chip(context, "影视站直搜（免代理）", siteMode) { setMode(true) }
+        modeRow.addView(a, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+            marginEnd = Ui.dp(context, 6f)
+        })
+        modeRow.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+    }
+
+    private fun setMode(site: Boolean) {
+        if (siteMode == site) return
+        siteMode = site
+        renderModeChips()
+        rv.visibility = if (site) View.GONE else View.VISIBLE
+        emptyView.visibility = View.GONE
+        siteList.visibility = if (site) View.VISIBLE else View.GONE
+        tvStatus.text = if (site) {
+            "国内影视站免代理直搜 · 打开详情页后点「抓资源」提取磁力"
+        } else {
+            "聚合 ${store.enabled().size} 个磁力源 · 境外源需代理"
+        }
+        if (site) renderSiteCards(etKeyword.text.toString().trim())
+    }
+
+    /** 影视站直搜：把关键词套进站点模板，列出可直接打开的结果入口 */
+    private fun renderSiteCards(keyword: String) {
+        siteList.removeAllViews()
+        val raw = sitePrefs.getString("custom_sites", "").orEmpty()
+        val sites = SiteDirectSearch.merged(raw)
+        for (s in sites) {
+            val card = Ui.card(context, 14f).apply { orientation = LinearLayout.HORIZONTAL }
+            val label = Ui.text(context, s.name, 14f, Ui.TXT, bold = true)
+            card.addView(label, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            val hint = Ui.text(context, "免代理", 11f, Ui.GREEN)
+            card.addView(hint, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginEnd = Ui.dp(context, 8f) })
+            val go = Ui.text(context, "搜索 ›", 13f, Ui.BLUE, bold = true)
+            card.addView(go)
+            Ui.pressable(card)
+            card.setOnClickListener {
+                val kw = etKeyword.text.toString().trim()
+                if (kw.isEmpty()) { Ui.toast(context, "请先输入关键词"); return@setOnClickListener }
+                val url = s.urlFor(kw)
+                onOpenSite(url)
+            }
+            card.setOnLongClickListener { showSiteTemplateDialog(); true }
+            siteList.addView(card, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = Ui.dp(context, 8f) })
+        }
+        val add = Ui.pillBtn(context, "＋ 添加影视站搜索模板", Ui.BLUE) { showSiteTemplateDialog() }
+        siteList.addView(add, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = Ui.dp(context, 2f) })
+        siteList.visibility = View.VISIBLE
+        if (keyword.isNotEmpty()) tvStatus.text = "输入关键词后点站点卡片，直接在浏览器站内搜索“$keyword”"
+    }
+
+    private fun showSiteTemplateDialog() {
+        val etName = Ui.singleLineEt(context, "站点名，如 高清族")
+        val etUrl = Ui.singleLineEt(context, "https://site/?s={kw}（必须含 {kw}）")
+        val box = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(Ui.dp(context, 20f), Ui.dp(context, 8f), Ui.dp(context, 20f), 0)
+            addView(etName)
+            addView(etUrl, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = Ui.dp(context, 8f) })
+        }
+        android.app.AlertDialog.Builder(context)
+            .setTitle("添加影视站搜索模板")
+            .setMessage("模板里用 {kw} 代表关键词；长按站点卡片可重新设置本站列表。")
+            .setView(box)
+            .setPositiveButton("保存") { _, _ ->
+                val site = SiteDirectSearch.parseTemplate("${etName.text}=${etUrl.text}")
+                if (site == null) {
+                    Ui.toast(context, "格式不对：名称=https://…?s={kw}")
+                } else {
+                    val raw = sitePrefs.getString("custom_sites", "").orEmpty()
+                    val list = SiteDirectSearch.decodeCustom(raw).filterNot { it.name == site.name } + site
+                    sitePrefs.edit().putString("custom_sites", SiteDirectSearch.encodeCustom(list)).apply()
+                    renderSiteCards(etKeyword.text.toString().trim())
+                    Ui.toast(context, "已添加 ${site.name}")
+                }
+            }
+            .setNeutralButton("恢复内置") { _, _ ->
+                sitePrefs.edit().putString("custom_sites", "").apply()
+                renderSiteCards(etKeyword.text.toString().trim())
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
     private fun doSearch() {
         val kw = etKeyword.text.toString().trim()
         if (kw.isEmpty()) { Ui.toast(context, "请输入关键词"); return }
+        if (siteMode) {
+            tvStatus.text = "点下方站点卡片，用“$kw”直搜影视站；打开详情页后点「抓资源」提取磁力"
+            renderSiteCards(kw)
+            return
+        }
         tvStatus.text = "正在聚合搜索“$kw”…"
         searching = true
         adapter.submit(emptyList())
@@ -153,6 +286,12 @@ class MagnetSearchPage(
                 if (report.okSources.isNotEmpty()) append(" · ${report.okSources.size}/${sources.size} 源在线")
                 if (report.failedSources.isNotEmpty()) append(" · 失效 ${report.failedSources.size} 个")
                 append(" · 点此看各源明细")
+            }
+            // v2.9.0：全源不可达时给明确出路，不再让用户对着一堆「连接超时」干等
+            if (report.results.isEmpty() && report.okSources.isEmpty() && sources.isNotEmpty()) {
+                tvStatus.text = SiteDirectSearch.unreachableHint(settings.proxyEnabled)
+                // 超时也可能来自代理本身，再给一键切换入口
+                Ui.toast(context, "可点上方「影视站直搜（免代理）」继续找资源")
             }
             renderDetail()
         }
