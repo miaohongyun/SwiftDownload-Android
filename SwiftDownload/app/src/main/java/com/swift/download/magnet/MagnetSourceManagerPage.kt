@@ -49,14 +49,21 @@ class MagnetSourceManagerPage(context: Context) : FrameLayout(context) {
             setMargins(Ui.dp(context, 14f), Ui.dp(context, 12f), Ui.dp(context, 14f), Ui.dp(context, 8f))
         })
 
-        // 两个操作按钮：添加新源 + 一键测试
+        // 三个操作按钮：添加新源 + 批量导入 + 一键测试
         val actions = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
-        actions.addView(primaryBtn(context, "＋ 添加新磁力源") { showAddDialog(context) },
+        actions.addView(primaryBtn(context, "＋ 添加") { showAddDialog(context) },
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = Ui.dp(context, 6f) })
-        actions.addView(primaryBtn(context, "测试连通性") { testAll() },
+        actions.addView(primaryBtn(context, "批量导入") { showBatchImportDialog(context) },
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = Ui.dp(context, 6f) })
+        actions.addView(primaryBtn(context, "测试") { testAll() },
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         root.addView(actions, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-            setMargins(Ui.dp(context, 14f), 0, Ui.dp(context, 14f), Ui.dp(context, 10f))
+            setMargins(Ui.dp(context, 14f), 0, Ui.dp(context, 14f), Ui.dp(context, 6f))
+        })
+        root.addView(Ui.text(context,
+            "批量导入支持「名称|网址」「名称 空格 网址」或 JSON 数组，网址需含 {kw}。",
+            11f, Ui.TXT_SUB), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            setMargins(Ui.dp(context, 14f), 0, Ui.dp(context, 14f), Ui.dp(context, 8f))
         })
 
         for (src in store.sources()) root.addView(buildRow(src))
@@ -114,6 +121,11 @@ class MagnetSourceManagerPage(context: Context) : FrameLayout(context) {
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { marginStart = Ui.dp(ctx, 8f) })
         }
+        if (src.useWebView) {
+            titleRow.addView(Ui.text(ctx, "WebView", 10f, Ui.TYPE_HLS, bold = true), LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginStart = Ui.dp(ctx, 8f) })
+        }
         col.addView(titleRow)
         val url = Ui.text(ctx, src.searchUrl, 12f, Ui.TXT_SUB)
         url.maxLines = 1
@@ -148,7 +160,7 @@ class MagnetSourceManagerPage(context: Context) : FrameLayout(context) {
         val isCustom = store.customSources().any { it.id == src.id }
         val opts = ArrayList<String>()
         opts.add("修改搜索地址")
-        if (isCustom) opts.add("修改名称 / 解析规则")
+        if (isCustom) opts.add("完整编辑（名称/代理/WebView）")
         opts.add("测试连通性")
         if (isCustom) opts.add("删除此源")
         AlertDialog.Builder(ctx)
@@ -156,7 +168,7 @@ class MagnetSourceManagerPage(context: Context) : FrameLayout(context) {
             .setItems(opts.toArray(arrayOfNulls<String>(0))) { _, which ->
                 when (opts[which]) {
                     "修改搜索地址" -> showEditDialog(ctx, src)
-                    "修改名称 / 解析规则" -> showEditCustomDialog(ctx, src)
+                    "完整编辑（名称/代理/WebView）" -> showEditCustomDialog(ctx, src)
                     "测试连通性" -> testOne(src)
                     "删除此源" -> {
                         AlertDialog.Builder(ctx)
@@ -231,26 +243,68 @@ class MagnetSourceManagerPage(context: Context) : FrameLayout(context) {
 
     private fun showEditCustomDialog(ctx: Context, src: MagnetSource) {
         val etName = Ui.singleLineEt(ctx, "源名称").apply { setText(src.name) }
+        val etUrl = Ui.singleLineEt(ctx, "https://…/{kw}").apply { setText(src.searchUrl) }
         val etParser = Ui.singleLineEt(ctx, "generic / torrentkitty / rowtable").apply { setText(src.parser) }
+        val swProxy = Switch(ctx).apply { isChecked = src.proxyRequired; text = "需代理" }
+        val swWebView = Switch(ctx).apply { isChecked = src.useWebView; text = "离屏 WebView 抓取（JS 站/403 盾）" }
         val wrap = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(Ui.dp(ctx, 20f), Ui.dp(ctx, 8f), Ui.dp(ctx, 20f), 0)
-            addView(etName, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            addView(etName)
+            addView(etUrl, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = Ui.dp(ctx, 8f) })
             addView(etParser, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = Ui.dp(ctx, 8f) })
+            addView(swProxy, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = Ui.dp(ctx, 10f) })
+            addView(swWebView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = Ui.dp(ctx, 6f) })
         }
         AlertDialog.Builder(ctx)
-            .setTitle("编辑「${src.name}」")
+            .setTitle("完整编辑「${src.name}」")
             .setView(wrap)
             .setPositiveButton("保存") { _, _ ->
-                val list = store.customSources().map {
-                    if (it.id == src.id) it.copy(
-                        name = etName.text.toString().trim().ifEmpty { src.name },
-                        parser = MagnetSourceRules.normalizeParser(etParser.text.toString())
-                    ) else it
-                }
-                store.saveCustom(list)
+                val url = MagnetSourceImport.normalizeUrl(etUrl.text.toString().trim())
+                val updated = src.copy(
+                    name = etName.text.toString().trim().ifEmpty { src.name },
+                    searchUrl = url,
+                    parser = MagnetSourceRules.normalizeParser(etParser.text.toString()),
+                    proxyRequired = swProxy.isChecked,
+                    useWebView = swWebView.isChecked
+                )
+                val err = MagnetSourceRules.validate(updated.name, updated.searchUrl, updated.parser)
+                if (err != null) { Ui.toast(ctx, err); return@setPositiveButton }
+                store.updateCustom(updated)
                 rebuild()
                 Ui.toast(ctx, "已保存")
+            }
+            .setNeutralButton("测试此源") { _, _ -> testOne(src) }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** v2.9.1：批量导入对话框 —— 粘贴后先预览解析结果，确认后一次性持久化 */
+    private fun showBatchImportDialog(ctx: Context) {
+        val et = Ui.singleLineEt(ctx, "每行一条：名称|https://site/?s={kw}\n或粘贴 JSON 数组")
+        et.isSingleLine = false
+        et.maxLines = 8
+        val wrap = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(Ui.dp(ctx, 20f), Ui.dp(ctx, 8f), Ui.dp(ctx, 20f), 0)
+            addView(et)
+            addView(Ui.text(ctx, "示例：\n我的站|https://example.com/s/{kw}\n动漫站 https://a.test/search?q={kw}\n[JSON 数组亦可]", 11f, Ui.TXT_SUB),
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = Ui.dp(ctx, 8f) })
+        }
+        AlertDialog.Builder(ctx)
+            .setTitle("批量导入磁力源")
+            .setView(wrap)
+            .setPositiveButton("解析并导入") { _, _ ->
+                val preview = MagnetSourceImport.parse(et.text.toString())
+                if (preview.accepted == 0) {
+                    Ui.toast(ctx, "没有可导入的源：${preview.errors.firstOrNull() ?: "格式不正确"}")
+                    return@setPositiveButton
+                }
+                val added = store.addCustomBatch(preview.sources)
+                rebuild()
+                Ui.toast(ctx, "已导入 $added 个源" +
+                    (if (preview.duplicates > 0) "（去重跳过 ${preview.duplicates}）" else "") +
+                    (if (preview.errors.isNotEmpty()) "，${preview.errors.size} 行有误" else ""))
             }
             .setNegativeButton("取消", null)
             .show()

@@ -4,6 +4,40 @@
 
 ---
 
+## v2.9.1 — 公有领域资源、批量导入与收尾清理（2026-11-19）
+
+版本号 `versionCode 15 / versionName 2.9.1`。
+
+### 任务一 — 合法公有领域资源站
+- 默认书签追加 3 个合法公有领域/开源站：`Archive影视`（archive.org/details/feature_films）、
+  `公有领域BT`（publicdomaintorrents.info）、`合法BT导航`（github.com/torrust/awesome-legal-torrent-sources）；
+  首次安装与「恢复默认书签」生效，老用户升级用一次性迁移标记仅追加缺失项，
+  不覆盖用户改名/改址/删过的自定义书签（迁移逻辑抽为 `BookmarkRules` 纯函数）。
+- 浏览器对公有领域站下载分流保持：`.torrent`（含 `?download` 形式）与 `x-bittorrent` 走 BT 引擎建任务，
+  `.mp4` 等直链走多线程 HTTP 下载。
+- 设置页新增「测试 BT 引擎（公有领域种子）」：预置 Big Buck Bunny（CC-BY 开源电影）种子，
+  支持粘贴任意 magnet / 40 位 hash / .torrent 地址；每 1 秒实时刷新 DHT节点 / Tracker / 已连节点 /
+  做种 / 速度并可一键「停止并清理」，测试任务不进入下载列表。
+
+### 任务二 — 磁力源批量导入与自动适配
+- 「磁力源管理」新增「批量导入」：兼容 `名称|网址`、`名称 空格/Tab 网址`、标准 JSON 数组三种格式；
+  自动补全 `https://`、校验 `{kw}` 占位、按 URL 去重，确认后一次性持久化（`MagnetSourceImport` 纯函数）。
+- 浏览器 ⋮ 菜单新增「把当前页设为搜索源」：输入刚才搜过的关键词，自动把网址中的关键词
+  （含 URL 编码/明文、查询参数/路径）替换为 `{kw}` 存入磁力源管理（`SearchTemplateRules` 纯函数）。
+- `MagnetSource` 新增 `useWebView` 源级开关：`HttpURLConnection` 遇 403/503/空壳页或用户勾选后，
+  自动切离屏 WebView 渲染 DOM 再交给 `MagnetParsers.generic` 解析；源管理页支持单源完整编辑
+  （名称/地址/解析规则/需代理/WebView/测试），卡片显示「需代理 / WebView」标签。
+- `MagnetParsers.generic` 通用扫描补齐相邻日期提取（原已有标题/大小/做种）。
+
+### 任务三 — 收尾清理
+- 移除临时崩溃诊断代码 `CrashReport` / `CrashActivity` / `SwiftApp` 及 Manifest 中的对应声明。
+- 外层 `README.md` 与 `SwiftDownload/README.md` 及四份文档统一到 v2.9.1。
+
+### 验证
+- `testDebugUnitTest` 222/222、`lintDebug` 0 Error、`assembleRelease` 成功；aapt2/apksigner 核验通过。
+
+---
+
 ## v2.9.0 — BT 引擎升级与手机单手交互重做（2026-11-19）
 
 版本号 `versionCode 14 / versionName 2.9.0`。`minSdk` 从 24 提升到 26（Android 8.0+）。

@@ -456,3 +456,22 @@ E2E-A 的 `.part` 残留并非断言写错：`segDone()` 在 `RandomAccessFile` 
 - 影视站直搜：高清族/电影港站内搜索能否打开详情页；「抓资源」能否提取到 magnet。
 - 单手操作：底部 5 键热区、标签抽屉、收藏弹窗、返回键行为是否符合拇指操作习惯。
 - 若用户曾开启 HTTP 代理，影视站直搜是否仍可直连（当前 WebView 代理为进程级全局，需用户手动关闭代理）。
+
+# v2.9.1 增量回归（公有领域资源 + 批量导入 + 收尾清理）
+
+## 门禁结果
+1. 版本升至 `versionCode 15 / versionName 2.9.1`。
+2. 三道门禁：`testDebugUnitTest` 222 通过（1 skipped 为既有网络用例）；`lintDebug` 0 Error；`assembleRelease` 成功。
+3. APK 核验：`versionCode=15`、`versionName=2.9.1`、`minSdk=26`、`targetSdk=36`，
+   `libjlibtorrent.so` 仍为 2.1.2.1 新版，v2 签名验证通过。
+
+## 新增纯 JVM 用例（V291RegressionTest，13 条）
+- 批量导入：管道/空白分隔、JSON needProxy+useWebView、按 URL 去重、缺占位符拒绝、JSON 往返保留字段。
+- 网页转源：查询参数（含 URL 编码）与路径末段关键词转 `{kw}`、关键词不在 URL 时拒绝。
+- 书签迁移：默认含 3 个公有领域站、合并不覆盖用户改名/自定义项、重复合并幂等。
+- WebView 兜底：useWebView 源强制兜底、成功源不兜底；BT 自检三格式解析与可达性判据。
+
+## 真机待验证项
+- BT 引擎自检按钮：默认公有领域种子能否在真机网络下拿到 DHT/Tracker/节点数字；`archive.org` 可达性。
+- 批量导入后自定义源在磁力搜中的实际命中；`useWebView` 源对 JS 渲染站的兜底命中率。
+- 「把当前页设为搜索源」对国内影视站 URL 模板的适配准确度。

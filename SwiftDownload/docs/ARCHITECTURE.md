@@ -458,3 +458,32 @@ init 里构建筛选胶囊时 `labelOf()` → `TaskFilters.counts(lastTasks)` �
 
 - 单测 200 → 209：新增 `V29RegressionTest`（9 个纯 JVM 用例）覆盖混合 tracker、诊断字段、
   死源清理、模板解析/覆盖、超时文案；`SourceLayoutGuardTest` 继续守卫 init 前成员声明。
+
+# v2.9.1 架构增量（公有领域资源 + 批量导入 + 收尾清理）
+
+## 纯逻辑分层（全部 JVM 单测覆盖）
+- `browser/BookmarkRules`：默认书签（4 原有 + 3 公有领域）与 `mergeMissingDefaults` 合并，
+  用户已有项按 URL 原样保留，仅追加缺失默认；`normalizeDefaultDomain` 做失效域名就地纠正。
+- `bt/BtSelfTestRules`：BT 自检输入解析（magnet/hash/.torrent URL）、诊断格式化、可达性判据；
+  默认种子为 Big Buck Bunny 公有领域 torrent URL（可配置，避免内置种子失效后功能不可用）。
+- `magnet/MagnetSourceImport`：三种格式（管道 / 空白 / JSON 数组）批量导入，校验 + 补全 https + 按 URL 去重。
+- `magnet/SearchTemplateRules`：URL + 用户关键词 → `{kw}` 搜索模板（兼容 URL 编码/明文、查询参数/路径）。
+
+## Android 层接入
+- `QuickSites.all()` 用一次性迁移标记（SharedPreferences）在升级后合并一次缺失默认书签，
+  避免把用户后来主动删除的默认项反复加回；`resetDefaults()` 直接写完整默认列表。
+- `BrowserPage` ⋮ 菜单新增「把当前页设为搜索源」（`showSaveAsSourceDialog`）；
+  `.torrent`/`x-bittorrent` 仍走 `onTorrentLink` 建 BT，`.mp4` 等直链走 HTTP 多线程。
+- `MagnetSource` 增 `useWebView` 字段，`MagnetSourceRules` JSON 编解码含 `proxyRequired/useWebView`；
+  `MagnetSourceStore` 增 `addCustomFull/addCustomBatch/updateCustom`；
+  `MagnetSearch.webViewFallbackSources` 统一决定兜底源（useWebView 强制 + 失败源自动）。
+- `MagnetParsers.generic` 补相邻日期 `dateNear`。
+- `DownloadSettingsPage` BT 自检对话框用 `TorrentEngine.get()` 单例直连，Handler 每秒轮询 `progressOf`，
+  测试 hash 与轮询 Runnable 均为页面成员（init 前声明），关闭/清理时 remove 并停止轮询。
+
+## 清理
+- 移除 `CrashReport` / `CrashActivity` / `SwiftApp` 及 Manifest 中 `android:name=".SwiftApp"` 与 CrashActivity 声明。
+
+## 测试策略增量
+- 单测 209 → 222：新增 `V291RegressionTest`（13 个纯 JVM 用例）覆盖批量导入三格式/去重/JSON 字段、
+  网页转模板、公有领域书签合并不覆盖、WebView 兜底决策、BT 自检解析与判据。

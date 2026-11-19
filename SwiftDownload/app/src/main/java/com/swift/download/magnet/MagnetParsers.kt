@@ -94,7 +94,11 @@ object MagnetParsers {
             val hash = MagnetLinks.normalizeHash(m.groupValues[1]) ?: continue
             if (seen.containsKey(hash)) continue
             val name = nearbyName(html, m.range.first) ?: decodeFromUrl(m.value)
-            seen[hash] = RawItem(hash, name, sizeNear(html, m.range.first), seedNear(html, m.range.first), null)
+            // v2.9.1：generic 通用扫描补齐相邻日期，与标题/大小/做种一起关联提取
+            seen[hash] = RawItem(
+                hash, name, sizeNear(html, m.range.first), seedNear(html, m.range.first),
+                dateNear(html, m.range.first)
+            )
         }
         return seen.values.toList()
     }
@@ -168,5 +172,11 @@ object MagnetParsers {
     private fun seedNear(html: String, pos: Int): Int {
         val window = html.substring(maxOf(0, pos - 200), minOf(html.length, pos + 200))
         return seedOf(window)
+    }
+
+    /** v2.9.1：取磁力链接邻近窗口里的日期（yyyy-MM-dd / yyyy/MM/dd 统一为 - ） */
+    private fun dateNear(html: String, pos: Int): String? {
+        val window = html.substring(maxOf(0, pos - 250), minOf(html.length, pos + 250))
+        return Regex("""\d{4}[-/]\d{2}[-/]\d{2}""").find(window)?.value?.replace('/', '-')
     }
 }

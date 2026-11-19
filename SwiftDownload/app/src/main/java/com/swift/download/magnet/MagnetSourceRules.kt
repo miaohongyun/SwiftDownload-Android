@@ -35,7 +35,8 @@ object MagnetSourceRules {
     fun encodeCustom(sources: List<MagnetSource>): String {
         val body = sources.joinToString(",") { s ->
             "{\"id\":${q(s.id)},\"name\":${q(s.name)},\"searchUrl\":${q(s.searchUrl)}," +
-                "\"parser\":${q(s.parser)},\"enabled\":${s.enabled}}"
+                "\"parser\":${q(s.parser)},\"enabled\":${s.enabled}," +
+                "\"proxyRequired\":${s.proxyRequired},\"useWebView\":${s.useWebView}}"
         }
         return "{\"sources\":[$body]}"
     }
@@ -48,7 +49,12 @@ object MagnetSourceRules {
             val url = strField(obj, "searchUrl") ?: return@mapNotNull null
             val parser = strField(obj, "parser") ?: "generic"
             if (id.isBlank() || name.isBlank() || url.isBlank()) return@mapNotNull null
-            MagnetSource(id, name, url, parser, boolField(obj, "enabled", true))
+            MagnetSource(
+                id = id, name = name, searchUrl = url, parser = parser,
+                enabled = boolField(obj, "enabled", true),
+                proxyRequired = boolField(obj, "proxyRequired", false) || boolField(obj, "needProxy", false),
+                useWebView = boolField(obj, "useWebView", false)
+            )
         }
     }
 

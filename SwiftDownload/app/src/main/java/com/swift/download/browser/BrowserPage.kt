@@ -1082,6 +1082,7 @@ class BrowserPage(
         val ctx = context
         val items = arrayOf(
             "抓资源",
+            "把当前页设为搜索源",
             "分享当前链接",
             if (desktopMode) "切换为手机版网页" else "切换为桌面版网页",
             "复制当前网址"
@@ -1091,14 +1092,68 @@ class BrowserPage(
             .setItems(items) { _, which ->
                 when (which) {
                     0 -> grabPageResources()
-                    1 -> shareCurrentLink()
-                    2 -> toggleDesktopMode()
-                    3 -> {
+                    1 -> showSaveAsSourceDialog()
+                    2 -> shareCurrentLink()
+                    3 -> toggleDesktopMode()
+                    4 -> {
                         val url = current?.url.orEmpty()
                         if (url.isNotBlank() && url != HOME_URL) copyText("网址", url)
                         else Ui.toast(ctx, "当前页没有可复制的网址")
                     }
                 }
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /**
+     * v2.9.1：把当前页设为搜索源 —— 用户先在站点搜一次关键词，
+     * 这里把 URL 中的关键词替换为 {kw} 生成模板，存入磁力源管理。
+     */
+    private fun showSaveAsSourceDialog() {
+        val ctx = context
+        val url = current?.url.orEmpty()
+        if (url.isBlank() || url == HOME_URL) {
+            Ui.toast(ctx, "请先打开搜索结果页再设为搜索源")
+            return
+        }
+        val etKw = Ui.singleLineEt(ctx, "输入刚才搜索的关键词")
+        val etName = Ui.singleLineEt(ctx, "源名称（如：某某站）").apply {
+            setText(current?.title?.take(16)?.ifBlank { "自定义站" } ?: "自定义站")
+        }
+        val hint = Ui.text(ctx, "当前网址：$url", 11f, Ui.TXT_SUB).apply {
+            maxLines = 2; ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
+        }
+        val box = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(Ui.dp(ctx, 20f), Ui.dp(ctx, 8f), Ui.dp(ctx, 20f), 0)
+            addView(etKw)
+            addView(etName, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = Ui.dp(ctx, 8f) })
+            addView(hint, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = Ui.dp(ctx, 10f) })
+        }
+        android.app.AlertDialog.Builder(ctx)
+            .setTitle("把当前页设为搜索源")
+            .setMessage("先在站点搜索一次，再填刚才的关键词；会自动把网址里的词换成 {kw}。")
+            .setView(box)
+            .setPositiveButton("保存为源") { _, _ ->
+                val result = com.swift.download.magnet.SearchTemplateRules.build(
+                    url, etKw.text.toString().trim()
+                )
+                if (!result.ok) { Ui.toast(ctx, result.error ?: "生成失败"); return@setPositiveButton }
+                val name = etName.text.toString().trim().ifBlank { "自定义站" }
+                val src = com.swift.download.magnet.MagnetSource(
+                    id = com.swift.download.magnet.MagnetSourceRules.makeId(result.template!!),
+                    name = name,
+                    searchUrl = result.template,
+                    parser = "generic",
+                    enabled = true
+                )
+                val err = com.swift.download.magnet.MagnetSourceStore.get(ctx).addCustomFull(src)
+                Ui.toast(ctx, if (err == null) "已保存到「我的 → 磁力源管理」" else err)
             }
             .setNegativeButton("取消", null)
             .show()
@@ -1509,17 +1564,15 @@ class QuickSites private constructor(private val ctx: Context) {
 
     private val file: File get() = File(ctx.filesDir, "quick_sites.json")
 
-    private val defaults = listOf(
-        // v2.9：修正默认书签域名（国内可直连的 cn 节点）
-        Site("必应", "https://cn.bing.com"),
-        Site("电影港", "https://www.dygang.cc"),
-        // v2.8 模块二：更新失效域名（高清族换新域，移除长期打不开的 SHB）
-        Site("高清族", "https://hdzu.cc"),
-        Site("磁力搜", "https://cn.bing.com/search?q=magnet")
-    )
+    private val defaults: List<Site> = BookmarkRules.DEFAULTS.map { Site(it.first, it.second) }
+
+    private val migratePrefs get() = ctx.getSharedPreferences("quick_sites_migration", Context.MODE_PRIVATE)
+    private val KEY_V291_MIGRATED = "v291_migrated"
 
     fun all(): List<Site> {
-        val loaded = if (!file.exists()) defaults else try {
+        // 文件不存在 = 首次安装，直接返回完整默认（含 3 个公有领域站）
+        if (!file.exists()) return defaults
+        val loaded: List<Site> = try {
             val arr = JSONArray(file.readText())
             (0 until arr.length()).map {
                 val o = arr.getJSONObject(it)
@@ -1528,15 +1581,22 @@ class QuickSites private constructor(private val ctx: Context) {
         } catch (e: Exception) {
             defaults
         }
-        // v2.9.0：老版本持久化书签里的失效域名就地纠正，用户无需手动重加
-        return loaded.map { normalizeDefaultDomain(it) }
-    }
-
-    private fun normalizeDefaultDomain(site: Site): Site = when (site.name) {
-        "必应" -> if (site.url.contains("bing.com")) defaults[0] else site
-        "电影港" -> if (site.url.contains("dygang")) defaults[1] else site
-        "高清族" -> if (site.url.contains("hdzu") || site.url.contains("gaoqingzu")) defaults[2] else site
-        else -> site
+        // v2.9.0：失效域名就地纠正（每次都做，幂等）
+        val normalized = loaded.map { s ->
+            val n = BookmarkRules.normalizeDefaultDomain(s.name, s.url)
+            Site(n.first, n.second)
+        }
+        // v2.9.1：仅升级后合并一次缺失的公有领域默认书签，不覆盖用户自定义项；
+        // 一次性标记避免把用户之后主动删除的默认书签反复加回来
+        if (!migratePrefs.getBoolean(KEY_V291_MIGRATED, false)) {
+            val merged = BookmarkRules.mergeMissingDefaults(
+                normalized.map { it.name to it.url }, BookmarkRules.DEFAULTS
+            ).map { Site(it.first, it.second) }
+            save(merged)
+            migratePrefs.edit().putBoolean(KEY_V291_MIGRATED, true).apply()
+            return merged
+        }
+        return normalized
     }
 
     fun add(name: String, url: String) {

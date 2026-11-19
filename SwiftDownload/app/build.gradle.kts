@@ -13,8 +13,8 @@ android {
         // 旧 1.2.0.18 的 NETLINK_ROUTE 在 Android 11+ 被 SELinux 拦截，BT 永远连不上节点。
         minSdk = 26
         targetSdk = 36
-        versionCode = 14
-        versionName = "2.9.0"
+        versionCode = 15
+        versionName = "2.9.1"
         ndk {
             // 只打包真机常用架构，避免 65MB 全架构 AAR 直接进 APK
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")

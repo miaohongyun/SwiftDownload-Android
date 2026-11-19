@@ -1,6 +1,7 @@
 package com.swift.download.settings
 
 import android.annotation.SuppressLint
+import android.app.AlertDialog
 import android.content.Context
 import android.view.View
 import android.view.ViewGroup
@@ -18,6 +19,12 @@ class DownloadSettingsPage(
     private val settings: DownloadSettings,
     private val onClose: () -> Unit = {}
 ) : LinearLayout(context) {
+
+    // v2.9.1：BT 自检状态（遵守成员顺序铁律：init 之前声明）
+    private var selfTestHash: String? = null
+    private val selfTestHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var selfTestRunnable: Runnable? = null
+    private var selfTestStartMs = 0L
 
     init {
         orientation = VERTICAL
@@ -324,8 +331,132 @@ class DownloadSettingsPage(
         card.addView(testDirect, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = Ui.dp(context, 8f) })
+
+        // v2.9.1：一键 BT 引擎自检（合法开源/公有领域种子），实时诊断 + 清理
+        val testBt = Ui.pillBtn(context, "测试 BT 引擎（公有领域种子）", Ui.BLUE) { showBtSelfTestDialog() }
+        card.addView(testBt, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = Ui.dp(context, 8f) })
+        card.addView(Ui.text(context, "可验证当前网络下 BT 引擎是否畅通；测试任务可一键清理，不进入下载列表。", 11f, Ui.TXT_SUB),
+            lpWrapTop(4f))
         card.layoutParams = cardLp()
         return card
+    }
+
+    /**
+     * v2.9.1：BT 引擎自检对话框。
+     * 预置公有领域种子，允许粘贴任意 magnet/.torrent/hash；轮询 progressOf 实时显示诊断。
+     */
+    private fun showBtSelfTestDialog() {
+        val ctx = context
+        val rules = com.swift.download.bt.BtSelfTestRules
+        val etSeed = Ui.singleLineEt(ctx, "magnet 链接 / 40 位 hash / .torrent 地址").apply {
+            setText(rules.DEFAULT_TEST_TORRENT_URL)
+        }
+        val tvDiag = Ui.text(ctx, "尚未开始测试。", 13f, Ui.TXT)
+        val tvHint = Ui.text(ctx, rules.DEFAULT_TEST_LABEL, 11f, Ui.TXT_SUB)
+        val box = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(Ui.dp(ctx, 20f), Ui.dp(ctx, 8f), Ui.dp(ctx, 20f), 0)
+            addView(etSeed)
+            addView(tvDiag, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = Ui.dp(ctx, 14f) })
+            addView(tvHint, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = Ui.dp(ctx, 8f) })
+        }
+
+        fun stopPolling() {
+            selfTestRunnable?.let { selfTestHandler.removeCallbacks(it) }
+            selfTestRunnable = null
+        }
+        fun cleanup() {
+            stopPolling()
+            selfTestHash?.let { com.swift.download.bt.TorrentEngine.get().remove(it) }
+            selfTestHash = null
+            tvDiag.text = "测试任务已清理。"
+        }
+
+        val dialog = AlertDialog.Builder(ctx)
+            .setTitle("BT 引擎自检")
+            .setView(box)
+            .setNeutralButton("停止并清理") { _, _ -> cleanup() }
+            .setPositiveButton("开始测试", null) // 下面用 OnShowListener 接管，避免点按钮自动关闭
+            .setNegativeButton("关闭") { _, _ -> cleanup() }
+            .create()
+
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val parsed = rules.parseInput(etSeed.text.toString())
+                if (!parsed.valid) { Ui.toast(ctx, parsed.error ?: "输入无效"); return@setOnClickListener }
+                cleanup()
+                selfTestStartMs = System.currentTimeMillis()
+                selfTestHash = when (parsed.kind) {
+                    com.swift.download.bt.BtSelfTestRules.InputKind.TORRENT_URL -> addSelfTestTorrentUrl(parsed.value)
+                    com.swift.download.bt.BtSelfTestRules.InputKind.MAGNET,
+                    com.swift.download.bt.BtSelfTestRules.InputKind.HASH -> {
+                        val hash = parsed.hash ?: run {
+                            Ui.toast(ctx, "该 magnet 无法解析出 hash，请改用 .torrent 链接")
+                            null
+                        }
+                        if (hash != null) {
+                            com.swift.download.bt.TorrentEngine.get().addMagnet(
+                                hash, parsed.value, java.io.File(ctx.cacheDir, "bt_selftest")
+                            )
+                        }
+                        hash
+                    }
+                    else -> null
+                }
+                if (selfTestHash == null) {
+                    tvDiag.text = "任务启动失败：无法解析种子，请检查链接或网络。"
+                    return@setOnClickListener
+                }
+                tvDiag.text = "任务已提交，正在等待节点…"
+                // 1s 轮询诊断
+                val poll = object : Runnable {
+                    override fun run() {
+                        val hash = selfTestHash ?: return
+                        val p = com.swift.download.bt.TorrentEngine.get().progressOf(hash)
+                        if (p == null) {
+                            tvDiag.text = "正在初始化 BT 会话…"
+                        } else {
+                            val d = com.swift.download.bt.BtSelfTestRules.Diagnostics(
+                                dhtNodes = p.dhtNodes, trackerCount = p.trackerCount,
+                                peers = p.peers, seeds = p.seeds, speedBps = p.speedBps,
+                                stateLabel = p.stateLabel, trackerError = p.trackerError,
+                                hasMetadata = p.hasMetadata
+                            )
+                            val secs = ((System.currentTimeMillis() - selfTestStartMs) / 1000).toInt()
+                            tvDiag.text = rules.format(d) + "\n" + rules.hint(d, secs)
+                            tvHint.text = if (rules.isReachable(d)) "✅ BT 引擎工作正常" else "⏳ 检测中…"
+                        }
+                        selfTestHandler.postDelayed(this, 1000)
+                    }
+                }
+                selfTestRunnable = poll
+                selfTestHandler.post(poll)
+            }
+        }
+        dialog.setOnDismissListener { cleanup() }
+        dialog.show()
+    }
+
+    /** .torrent URL：先用 HttpUtil 拉取到缓存文件，再交给引擎，返回 hash */
+    private fun addSelfTestTorrentUrl(url: String): String? {
+        val conn = try { com.swift.download.HttpUtil.open(url) } catch (e: Exception) { return null }
+        return try {
+            val bytes = conn.inputStream.use { it.readBytes() }
+            val dir = java.io.File(context.cacheDir, "bt_selftest").apply { mkdirs() }
+            val f = java.io.File(dir, "selftest_${System.currentTimeMillis()}.torrent")
+            f.writeBytes(bytes)
+            com.swift.download.bt.TorrentEngine.get().addTorrentFile(f, dir)
+        } catch (e: Exception) {
+            null
+        } finally {
+            conn.disconnect()
+        }
     }
 
     /** v2.7 Stage3.1：浏览器广告拦截总开关 + 自定义规则 */

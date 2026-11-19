@@ -194,6 +194,22 @@ object MagnetSearch {
         )
     }
 
+    /**
+     * v2.9.1：决定哪些源需要离屏 WebView 兜底（纯函数，可单测）。
+     * - useWebView=true 的源：无论 HTTP 结果如何都强制走 WebView 渲染（JS 站/403 盾）
+     * - 其余源：仅当状态非 OK（空壳/403/超时）时自动兜底，保持 v2.8 行为
+     */
+    fun webViewFallbackSources(
+        sources: List<MagnetSource>,
+        report: SearchReport
+    ): List<MagnetSource> {
+        if (sources.isEmpty()) return emptyList()
+        val statusById = report.outcomes.associateBy { it.sourceId }
+        return sources.filter { s ->
+            s.useWebView || (statusById[s.id]?.status ?: SourceStatus.NETWORK) != SourceStatus.OK
+        }
+    }
+
     /** 异常 → 诊断状态（纯函数，可单测） */
     fun classifyFailure(t: Throwable): SourceStatus {
         var e: Throwable? = t

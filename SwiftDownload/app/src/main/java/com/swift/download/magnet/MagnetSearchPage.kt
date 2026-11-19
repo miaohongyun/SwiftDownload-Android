@@ -263,13 +263,11 @@ class MagnetSearchPage(
         scope.launch {
             val report = withContext(Dispatchers.IO) {
                 val first = MagnetSearch.search(kw, sources, MagnetSearch.defaultFetcher())
-                // v2.8 模块四 4.2：对空壳/被拦截源启用离屏 WebView 等 JS 渲染后兜底
-                val fallbackIds = first.outcomes
-                    .filter { it.status != MagnetSearch.SourceStatus.OK }
-                    .map { it.sourceId }
-                if (fallbackIds.isEmpty()) return@withContext first
+                // v2.9.1：useWebView 源强制走离屏渲染；其余仅对失败源兜底（规则见 MagnetSearch.webViewFallbackSources）
+                val fallbackSources = MagnetSearch.webViewFallbackSources(sources, first)
+                if (fallbackSources.isEmpty()) return@withContext first
                 val fallbackRaw = LinkedHashMap<String, List<MagnetParsers.RawItem>>()
-                for (s in sources.filter { it.id in fallbackIds }) {
+                for (s in fallbackSources) {
                     val html = OffscreenHtmlFetcher.fetch(context, s.urlFor(kw))
                     if (!html.isNullOrBlank()) {
                         val items = MagnetParsers.parse(s.parser, html)

@@ -26,7 +26,8 @@ class MagnetSourceStore private constructor(private val ctx: Context) {
                     parser = def.parser,
                     enabled = ov.optBoolean("enabled", def.enabled),
                     // v2.9.0：覆盖地址/开关时保留「需代理」标注，避免老配置丢失标签
-                    proxyRequired = def.proxyRequired
+                    proxyRequired = def.proxyRequired,
+                    useWebView = def.useWebView
                 )
             } else def.copy()
         }
@@ -41,19 +42,42 @@ class MagnetSourceStore private constructor(private val ctx: Context) {
     /**
      * v2.8：新增自定义源。返回 null 表示成功，否则为给用户看的校验错误。
      */
-    fun addCustom(name: String, searchUrl: String, parser: String): String? {
-        val err = MagnetSourceRules.validate(name, searchUrl, parser)
-        if (err != null) return err
-        val src = MagnetSource(
+    fun addCustom(name: String, searchUrl: String, parser: String): String? = addCustomFull(
+        MagnetSource(
             id = MagnetSourceRules.makeId(searchUrl),
             name = name.trim(),
             searchUrl = searchUrl.trim(),
             parser = MagnetSourceRules.normalizeParser(parser),
             enabled = true
         )
+    )
+
+    /** v2.9.1：完整字段新增（批量导入/网页转源用），返回 null 表示成功 */
+    fun addCustomFull(src: MagnetSource): String? {
+        val err = MagnetSourceRules.validate(src.name, src.searchUrl, src.parser)
+        if (err != null) return err
         val list = customSources().filter { it.id != src.id } + src
         writeCustom(list)
         return null
+    }
+
+    /** v2.9.1：批量追加（按 id 去重），返回实际新增条数 */
+    fun addCustomBatch(sources: List<MagnetSource>): Int {
+        if (sources.isEmpty()) return 0
+        val existing = customSources().toMutableList()
+        val ids = existing.map { it.id }.toHashSet()
+        var added = 0
+        for (s in sources) {
+            if (MagnetSourceRules.validate(s.name, s.searchUrl, s.parser) != null) continue
+            if (ids.add(s.id)) { existing.add(s); added++ }
+        }
+        writeCustom(existing)
+        return added
+    }
+
+    /** v2.9.1：完整编辑单个源（名称/地址/解析规则/需代理/WebView/开关） */
+    fun updateCustom(src: MagnetSource) {
+        writeCustom(customSources().map { if (it.id == src.id) src else it })
     }
 
     /** v2.8：删除自定义源；内置源不允许删除（只能禁用） */

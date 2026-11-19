@@ -13,7 +13,9 @@ data class MagnetSource(
     val parser: String,            // torrentkitty | dmhy | rowtable | generic
     var enabled: Boolean = true,
     /** v2.9.0：境外源需 HTTP 代理才能在国内 5G 直连，UI 上必须显著标注 */
-    val proxyRequired: Boolean = false
+    val proxyRequired: Boolean = false,
+    /** v2.9.1：JS 渲染站/403 盾源，抓取失败时改用离屏 WebView 渲染 DOM 再解析 */
+    val useWebView: Boolean = false
 ) {
     fun urlFor(keyword: String): String =
         searchUrl.replace("{kw}", keyword.urlEnc())
