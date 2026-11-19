@@ -6,17 +6,18 @@
 
 ## 当前版本
 
-**v2.6.0**（versionCode 11），源码位于 `SwiftDownload/`（目录名已去除版本号，永久规范化）。
+**v2.7.0**（versionCode 12），源码位于 `SwiftDownload/`（目录名已去除版本号，永久规范化）。
 
-- 单元测试：**139/139 通过**
-- Git Tag：`v2.5.3`（清理前基线）、`v2.6.0`（当前版本）
+- 单元测试：**184/184 通过**
+- Git Tag：`v2.5.3`（清理前基线）、`v2.6.0`、`v2.7.0`（当前版本）
 
 ## 目录
 
 | 路径 | 说明 |
 | --- | --- |
-| `SwiftDownload/` | **当前源码工程**（v2.6.0），含完整文档与 139 个单元测试 |
-| `SwiftDownload-v2.6.0-Phase1..4.patch` | 四个阶段的独立补丁存档（仅本地，不入库） |
+| `SwiftDownload/` | **当前源码工程**（v2.7.0），含完整文档与 184 个单元测试 |
+| `SwiftDownload-v2.6.0-Phase1..4.patch` | v2.6.0 四个阶段的独立补丁存档（仅本地，不入库） |
+| `SwiftDownload-v2.7-Stage1..4.patch` | v2.7.0 Stage 1–4 的独立补丁存档（仅本地，不入库） |
 | `SwiftDownload-v2.6.0.bundle` | 提交的可移植 Git bundle（仅本地，不入库） |
 
 旧工作副本与 v2.5.3 的源码 zip / APK 已从仓库清理；需要历史产物可检出 `v2.5.3` tag。

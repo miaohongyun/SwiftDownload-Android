@@ -4,7 +4,7 @@ Android 下载工具：多线程 HTTP、断点续传、内置浏览器与视频�
 BT 选文件、边下边播、DLNA 投屏、局域网投递、文件哈希校验。Kotlin + 原生 jlibtorrent，
 无第三方 UI / 网络框架。
 
-当前版本：**v2.6.0**（versionCode 11）。共 **139 个 JVM 单元测试，139/139 通过**。
+当前版本：**v2.7.0**（versionCode 12）。共 **184 个 JVM 单元测试，184/184 通过**。
 
 ## 文档
 
@@ -22,16 +22,19 @@ BT 选文件、边下边播、DLNA 投屏、局域网投递、文件哈希校验
 | 多线程 HTTP | Range 探测 / 分段并发 / 慢连接 Work Stealing 接管 / `.swiftprog` 带区间断点 / 1 秒速度采样 |
 | 完整性验收 | 校验 206、`Content-Range`、每段字节数、合并长度；不合格一律 FAILED，不产出"假完成"文件 |
 | 网络健壮性 | 统一 HttpUtil（301/302/303/307/308 跨协议、最多 5 跳、Range 每跳重放）、2xx 防呆、未知长度流式下载 |
-| 内置浏览器 | 多标签 WebView / 书签 / 嗅探角标（N）/ 剪贴板智能识别（直链 + 磁力）/ 生命周期转发 |
-| 视频嗅探 | mp4/m3u8/mkv/flv/mov/webm；解析清晰度；来源页 Referer + Cookie；多视频可批量下载 |
-| m3u8 / HLS | AES-128 解密（CBC/PKCS5Padding）、EXT-X-BYTERANGE、4 线程分片 + 3 次重试、按序拼接；fMP4/SAMPLE-AES 明确拒绝 |
+| 内置浏览器 | 多标签 WebView / 广告拦截与恶意跳转防护 / 桌面-手机 UA 切换 / 长按图片-链接菜单 / 书签 / 嗅探角标（N）/ 剪贴板智能识别 / 生命周期转发 |
+| 视频嗅探 | mp4/m3u8/mkv/flv/mov/webm；解析清晰度；来源页 Referer + Cookie；多视频批量下载 / 多链接批量建任务 |
+| m3u8 / HLS | AES-128 解密（CBC/PKCS5Padding）、EXT-X-BYTERANGE、fMP4（EXT-X-MAP）init 段拼接、TS 无重编码封装 MP4；4 线程分片 + 3 次重试、按序拼接回滚；SAMPLE-AES/DRM 明确拒绝 |
 | 磁力搜索 | 5 个规则源并发、infohash 去重合并、来源数 + 做种排序、失效源跳过 |
-| BT | jlibtorrent 1.2.0.18，元数据回填、选文件下载（IGNORE 优先级）、顺序下载开关、就绪视频预览 |
-| 边下边播 | 本地 HTTP 服务接管；已下读盘、缺失拉取并回写；HEAD + 并发 Range 安全；播放器断开 8 秒后恢复多线程 |
+| BT | jlibtorrent 1.2.0.18，代理/SOCKS5 + 自动停种策略 + 上传限速 + 公开 Tracker；元数据回填、选文件下载（IGNORE 优先级）、顺序下载开关、`setPieceDeadline` 按需边下边播与就绪预览 |
+| 边下边播 | 本地 HTTP 服务接管；已下读盘、缺失拉取并回写；HEAD + 并发 Range 安全；播放器断开 8 秒后恢复多线程；BT piece 预读调度 |
 | DLNA 投屏 | SSDP 发现 → DIDL-Lite 元数据 → SOAP 播放/停止；WakeLock/WiFiLock 保活；MediaStore 文件零拷贝投屏 |
-| 下载控制 | 全局限速、仅 Wi-Fi、时段调度、并发队列（1–5，默认 3）、规则实时联动、自动分类、单任务限速 |
-| 文件 | 完成后经 MediaStore 导出公共 `Download/极速下载/`；MD5/SHA-1/SHA-256 校验与比对；排序/分享/重命名 |
+| 下载韧性 | 刷新链接保留断点（大小一致+Range 校验）、网络瞬断指数退避重试（3s→10s→30s，0–5 次）、空间前置校验、任务详情弹窗（原始/最终 URL 可复制） |
+| 下载控制 | 全局限速、仅 Wi-Fi、时段调度、并发队列（1–5，默认 3）、规则实时联动、自动分类、单任务限速、状态筛选（全部/进行中/完成/失败） |
+| 文件 | 完成后经 MediaStore 导出公共 `Download/极速下载/`；MD5/SHA-1/SHA-256 校验；ZIP 安全解压（防 Zip Slip）、文本/日志/字幕内置查看、排序/分享/重命名 |
+| 备份生态 | 「我的 → 备份与恢复」一键导出/导入 JSON：书签、磁力源、广告规则、全部下载设置（带版本校验、合并/覆盖） |
 | 局域网投递 | 「我的 → 局域网传链接」开启内嵌 Web 控制台：粘贴链接、上传 .torrent、实时查看任务列表 |
+| UI 适配 | targetSdk 36 Edge-to-Edge 安全边距、锁定浅色主题、动态数字等宽（tnum）、浏览器标签 × 关闭与平滑滚动 |
 
 ## 工程结构
 
@@ -44,22 +47,22 @@ SwiftDownload/
 │   │   ├── DownloadTask.kt                    # 任务模型（含 cookie/userAgent/exportUri）
 │   │   ├── DownloadEngine.kt                  # 多线程 HTTP 引擎 + Work Stealing（纯 JVM 可测）
 │   │   ├── DownloadService.kt                 # 前台服务：调度 / 通知 / 流会话 / 导出 / 远程面板
-│   │   ├── DownloadDatabase.kt                # SQLite v1→v4 增量迁移
+│   │   ├── DownloadDatabase.kt                # SQLite v1→v5 增量迁移（仅 ALTER TABLE）
 │   │   ├── HttpUtil.kt                        # 统一连接打开器（重定向 / UA / Cookie）
 │   │   ├── FileHash.kt / HashDialog.kt        # 哈希计算与校验弹窗
 │   │   ├── MediaStoreExport.kt                # 公共 Download 导出
 │   │   ├── QueueRules.kt / BtTaskRules.kt     # 队列与任务状态纯逻辑
-│   │   ├── browser/                           # 多标签浏览器 + 嗅探结果
-│   │   ├── transfers/                         # 传输页（BT 选文件 / 哈希入口）
-│   │   ├── files/                             # 文件页 + 排序 + 重命名
+│   │   ├── browser/                           # 多标签浏览器 + AdBlocker + 嗅探结果
+│   │   ├── transfers/                         # 传输页（BT 选文件 / 状态筛选 / 任务详情）
+│   │   ├── files/                             # 文件页 + 排序 + ZIP 解压 + 文本查看
 │   │   ├── magnet/                            # 磁力源 / 解析器 / 聚合搜索
-│   │   ├── player/                            # StreamServer / HLS / 嗅探 / AES
+│   │   ├── player/                            # StreamServer / HLS(fMP4+TS 封装) / 嗅探 / AES
 │   │   ├── dlna/                              # SSDP + DIDL-Lite SOAP + 设备选择器
-│   │   ├── bt/                                # TorrentEngine + 文件选择纯逻辑
+│   │   ├── bt/                                # TorrentEngine + 代理/停种/Tracker + piece 调度
 │   │   ├── remote/                            # 局域网 Web 投递面板
-│   │   ├── settings/                          # 设置 / 规则 / 限速器
+│   │   ├── settings/                          # 设置 / 规则 / 重试 / 备份编解码与恢复
 │   │   └── ui/                                # 代码构建 UI 助手
-│   └── src/test/                              # 139 个 JVM 单元测试
+│   └── src/test/                              # 184 个 JVM 单元测试
 ├── docs/                                      # 用户手册 / 架构 / 变更 / 回归
 ├── keystore/swiftdl.jks                       # 自签发布密钥（自用）
 └── scripts/build.sh                           # 测试 + Release 一键构建
@@ -89,15 +92,19 @@ SwiftDownload/
 ./gradlew testDebugUnitTest
 ```
 
-当前 **139 个 JVM 用例，139/139 通过**。覆盖：
+当前 **184 个 JVM 用例，184/184 通过**（v2.5.3 的 90 → v2.6.0 的 139 → v2.7.0 的 184）。覆盖：
 
 - 下载完整性：正常分段 / 忽略 Range / 短响应 / 错误 Content-Range / 404 错误页 / Chunked 无长度 / Cookie 校验；
 - 网络：跨端口 302 重定向、finalUrl 分段复用；
 - 并发安全：StreamServer HEAD + 双连接并发 Range、TaskBacking 并发 fetch、Work Stealing 慢段接管；
-- 断点恢复：动态切分后的三列 `.swiftprog` 还原、旧两列格式兼容；
-- HLS：AES-128 加解密往返、BYTERANGE 解析、多 Key 轮换、端到端加密流逐字节校验、缓存目录清理；
-- BT：文件优先级、最大视频选择、就绪判定、listener 防重；
-- 系统适配：DB v4 增量列、队列上限、导出路径、投屏 DIDL 元数据、VPN 网卡过滤、局域网协议与端口复用；
+- 断点恢复：动态切分后的三列 `.swiftprog` 还原、旧两列格式兼容、刷新链接保留断点判定；
+- 韧性：瞬断/5xx 可恢复分类、硬错误不可恢复、退避序列、空间阈值边界与文案；
+- HLS：AES-128 加解密往返、BYTERANGE 解析、fMP4 `EXT-X-MAP` 解析、多 Key 轮换、端到端加密流逐字节校验、缓存目录清理、封装格式决策；
+- BT：文件优先级、最大视频选择、就绪判定、listener 防重、代理生效/停种策略/上传限速/Tracker 追加、piece 覆盖与预读；
+- 浏览器：AdBlocker 域名/URL/自定义规则匹配、scheme 白名单、多链接去重提取与分类；
+- 文件工具：Zip Slip 路径穿越防护与边界、文本类型判定；
+- 备份：JSON 序列化与往返还原、版本校验、文件名格式；
+- 系统适配：DB v5 增量列、队列上限、导出路径、投屏 DIDL 元数据、VPN 网卡过滤、局域网协议与端口复用、状态筛选计数；
 - 哈希：MD5/SHA-1/SHA-256 标准向量与比对归一化。
 
 `RealEngineE2eTest`（真实下载 + SHA-1 比对 + 中断续传）与 `RealWorldProbeTest`（真实 HLS 形态）
@@ -123,7 +130,7 @@ v2.5.2 之前，异常服务器响应可能让不完整或错位的文件被标�
 
 ## 已知事项与限制
 
-1. **HLS**：支持 AES-128 与 ByteRange；fMP4（`EXT-X-MAP`）与 `SAMPLE-AES` 等 DRM 明确拒绝。
+1. **HLS**：支持 AES-128、ByteRange 与 fMP4（`EXT-X-MAP` + init 段拼接，TS 可无重编码封装为 MP4）；`SAMPLE-AES` 等 DRM 仍然拒绝。
 2. **未知长度**：无 `Content-Length` 时单线程流式下载，不支持断点续传。
 3. **边下边播**：仅 HTTP 直链且服务器返回 `Content-Length`；BT 不支持；mp4 的 moov 在文件末尾时拖动无效。
 4. **投屏**：需同一 Wi-Fi，DLNA 兼容性因品牌而异；部分电视需手动开启"多屏互动"。
@@ -137,6 +144,7 @@ v2.5.2 之前，异常服务器响应可能让不完整或错位的文件被标�
 
 | 版本 | 主题 |
 | --- | --- |
+| v2.7.0 | 五阶段体验升级：刷新保留断点/自动重试/空间校验/任务详情、BT 代理停种 Tracker+按需边播+fMP4/TS 封装、浏览器净化+细节+批量建任务、Edge-to-Edge+筛选+ZIP/文本工具+备份 |
 | v2.6.0 | 并发/网络/引擎/交互四阶段升级：Work Stealing、HLS AES、Cookie、MediaStore、局域网投递 |
 | v2.5.3 | 代码清理 + 文档完善 |
 | v2.5.2 | 数据完整性：完整性验收、HLS 拒绝不支持特性、换链接/重下彻底重置 |

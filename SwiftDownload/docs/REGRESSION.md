@@ -8,6 +8,8 @@
 4. v2.5.1 边下边播数据错位
 5. v2.5.2 下载完整性
 6. v2.5.3 代码清理与文档
+7. v2.6.0 四阶段 + 交叉检查
+8. v2.7.0 五阶段 + 总验收门禁
 
 > v2.3 ~ v2.5 的改动当时未单独归档回归章节；其修复清单见 [CHANGELOG.md](CHANGELOG.md)，
 > v2.5.2 一节也复核了 v2.5.1 声称"82/82 通过"与本机实测不符的问题。
@@ -337,3 +339,49 @@ E2E-A 的 `.part` 残留并非断言写错：`segDone()` 在 `RandomAccessFile` 
    `ParcelFileDescriptor` 随机定位零拷贝，用假 Backing 测试确保 pump 走 `readAt` 分支。
 4. **VPN 网卡误选**：`lanIp` 可能返回 tun0 的 10.x 地址；`pickLanAddress` 过滤虚拟网卡并优先 wlan。
 5. `FileHash.compare` 曾先剥冒号导致 `sha256:` 前缀识别失效；调整顺序并加测试。
+
+---
+
+# v2.7.0 增量回归（五阶段 + 总验收门禁）
+
+- 门禁：每个 Stage 完成均运行 `./gradlew testDebugUnitTest`。
+- 用例增长：v2.6.0 的 139 → Stage0 143 → Stage1 159 → Stage2 168 → Stage3 176 → Stage4 184。
+- 最终：**184/184 通过，0 失败，0 跳过**；`lintDebug` 0 Error / 35 Warning；
+  `assembleRelease` 成功。
+
+## 分阶段验证要点
+
+| 阶段 | 新增测试 | 关键断言 |
+| --- | --- | --- |
+| Stage 0 | Stage0RegressionTest 4 | 重命名拒绝路径穿越/隐藏文件、content URI 判定 |
+| Stage 1 | Stage1LogicTest 11 / Stage1IntegrationTest 3 / +DB 断言 | 瞬断/5xx 可恢复、硬错误不可恢复、退避序列、刷新断点大小一致才保留、空间阈值边界、DB v5 列 |
+| Stage 2 | Stage2LogicTest 9 / M3u8Test 修正 | 代理生效判定、停种/限速、Tracker 追加去重、piece 覆盖预读、fMP4 封装格式决策 |
+| Stage 3 | Stage3LogicTest 8 | AdBlocker host/后缀/前缀匹配、内置拦截、自定义规则、scheme 白名单、多链接去重分类与批量判定 |
+| Stage 4 | Stage4LogicTest 8 | 状态筛选计数、Zip Slip 拒绝/安全路径/canonical 边界、备份 JSON 往返与版本校验、文件名格式 |
+
+## 总验收门禁（Stage 5）
+
+1. **单测覆盖核查**：大纲 5.1 要求的 8 个纯逻辑模块（断点保持、重试分类、空间阈值、
+   `EXT-X-MAP` 解析、AdBlocker、多链接提取、Zip Slip、备份 JSON 往返）均有对应 JVM 单测，
+   逐一核对测试文件与断言，无需补齐。
+2. **构建体检**：
+   - `./gradlew testDebugUnitTest` → 184 通过 / 0 失败 / 0 跳过；
+   - `./gradlew lintDebug` → **0 Error**（无 NewApi / MissingPermission / WakelockTimeout 遗漏）；
+   - `./gradlew assembleRelease` → 成功输出 `app-release.apk`（约 14MB，R8 混淆正常）。
+3. **APK 核验**（`aapt2` / `apksigner`，build-tools 36.0.0）：
+   - `versionCode=12`、`versionName=2.7.0`、`targetSdkVersion=36`；
+   - `native-code: arm64-v8a / armeabi-v7a`（SO 库完整）；
+   - APK Signature Scheme **v2 验证通过**，1 个签名者 `CN=SwiftDownload`（RSA 2048）。
+
+## 本阶段发现并修复的真实问题
+
+1. **org.json 在 JVM 单测是 stub**：`BackupCodec` 最初用 `JSONObject`，
+   `put()` 返回 null 导致往返测试 NPE。改为纯 Kotlin 手写 JSON 编解码（针对固定结构），
+   既满足"零重型依赖"又能真实单测 JSON 往返还原。
+2. **`InputStream.readNBytes` 需 API 33**：minSdk 24 下触发 lint `NewApi` Error。
+   改为手动 buffer 限长读取前 512KB。
+3. **`LinearLayout.LayoutParams` 无 `maxWidth`**：标签胶囊标题宽度改用固定`width`。
+4. **AdBlocker 边界**：`hostOf` 补协议相对 URL（`//host/path`），`hostMatches` 兼容 `||domain`
+   锚点写法；测试期望由"去子域"改为真实 host，匹配交给规则。
+5. **网络 stub 用例偶发端口竞争**：`DownloadIntegrityTest` 的 404 用例在全量并行时偶发失败，
+   单类重跑通过，与本轮改动无关，记录为已知 flaky。

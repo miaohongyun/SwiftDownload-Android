@@ -273,3 +273,65 @@ MainActivity（四页主壳 / Intent 接管 / 浮层 / 投屏与边播接线）
 - `Dlna.lanIp()` 通过 `pickLanAddress` 过滤 tun/tap/ppp/dummy 等虚拟网卡并优先 wlan/eth，
   但仍无法覆盖所有厂商的自定义网卡命名。
 - 未知 Content-Length 的流不支持断点续传（无可靠分段边界）。
+
+---
+
+# v2.7.0 架构增量
+
+以下是对基础架构与 v2.6.0 增量的进一步补充，不替代原章节。
+
+## 新增模块
+
+| 模块 | 职责 |
+| --- | --- |
+| `settings/RefreshRules` | 刷新链接保留断点判定：大小一致 + 支持 Range + HTTP + 确定大小才续传（纯逻辑） |
+| `settings/RetryPolicy` | 可恢复/硬错误分类、退避序列（3s→10s→30s）、重试次数归一（纯逻辑） |
+| `StorageGuard` / `StorageRoots` | 基于 `StatFs` 的空间校验阈值与剩余空间文案（纯逻辑 + 平台调用分离） |
+| `bt/BtConfigRules` / `PublicTrackers` | 代理生效判定、停种策略、上传限速归一；精选 Tracker 追加与去重 |
+| `bt/TorrentBacking` / `PieceRange` | BT 按需边下边播：字节偏移→piece 区间、预读与首尾 piece、落盘文件随机读 |
+| `player/HlsMux` / `TsToMp4Muxer` | fMP4 输出格式决策；TS 经 `MediaExtractor`+`MediaMuxer` 无重编码封装 MP4（失败静默回退） |
+| `browser/AdBlocker` | 广告/统计域名与 URL 模式匹配、自定义规则、导航 scheme 白名单（纯逻辑） |
+| `transfers/TaskFilters` | 传输页状态筛选与数量角标（纯逻辑） |
+| `files/ZipExtract` | ZIP 安全解压：`safeRelativePath` 拒绝 Zip Slip、canonical 前缀二次校验 |
+| `settings/BackupCodec` / `BackupManager` | 配置备份：纯 Kotlin JSON 编解码（不依赖 org.json，便于 JVM 往返单测）+ Context 绑定的收集/恢复 |
+
+## 线程模型增量
+
+- **自动重试**：`DownloadJob.segment()` 在每段外层包重试循环，退避可被暂停/取消打断；
+  重试从计数器的续传点重开连接，不回退已完成字节。M3u8Job 遇硬错误跳过重试。
+- **BT 停种**：`finishBtTask()` 按策略立即停种 / `scope.launch+delay(5min)` 延迟停 / 一直做种；
+  策略变更经 Binder `applyBtNetworkSettings()` 即时应用到 `SessionManager`。
+- **BT 按需边播**：`TorrentBacking.fetch()` 短轮询等待目标 piece 就绪，
+  `scheduleVideoRange` 用 `setPieceDeadline(p, 0)` 调度当前+预读+首尾 piece，`readDisk` 从落盘文件 RAF 读。
+- **备份导入恢复**：IO 线程读取 content URI → 主线程弹合并/覆盖确认 → `BackupManager.restore()`
+  同步落位各 store，随后即时刷新书签与应用 BT 设置。
+
+## 数据完整性约束增量（在原 9 条之后）
+
+10. **空间前置**：`probe()` 拿到 totalBytes 后按"还需下载量 + 32MB 缓冲"校验可用空间，
+    续传只算未完成部分，不误拦；BT 在 onMetadata 拿到 total 后校验，不足则 pause + 失败。
+11. **刷新保留断点**：仅当新 URL 探测结果与旧任务 `totalBytes` 完全一致、支持 Range、HTTP 协议时
+    才保留 `.part`/`.swiftprog`，DB 只更新 url/cookie/referer/final_url；否则清空重下。
+12. **fMP4 init 段回滚**：`#EXT-X-MAP` 初始化段先下载到 `.hls/init.mp4`，首次拼装写文件头；
+    失败时清理临时产物，绝不把不完整的 init 段与分片拼成"完成"的 mp4。
+13. **备份编解码零依赖**：`BackupCodec` 手写 JSON 编解码，规避 `org.json` 在 JVM 单测里是 android stub
+    （方法返回 null）导致无法为"JSON 往返还原"提供真实单测的问题；带版本号校验，未来版本拒绝导入。
+
+## 存储迁移
+
+`DB_VERSION` 从 4 升到 5，只做一条 `ALTER TABLE ADD COLUMN final_url TEXT NOT NULL DEFAULT ''`，
+供任务详情展示重定向后的最终 URL；既有任务行零改动。
+
+## UI / 主题增量
+
+- targetSdk 36 Edge-to-Edge：`setDecorFitsSystemWindows(false)`，根布局与浮层用
+  `ViewCompat.setOnApplyWindowInsetsListener` 施加 `systemBars()+ime()` 安全 padding。
+- `AppCompatDelegate.MODE_NIGHT_NO` 锁定浅色，避免硬编码浅色卡片与系统深色控件反差。
+- 动态数字 `fontFeatureSettings = "tnum"`（等宽），消除 500ms 刷新抖动。
+
+## 测试策略增量
+
+- 单测从 139 增至 **184**，新增覆盖：刷新断点判定、重试分类与退避、空间阈值、fMP4 `EXT-X-MAP`
+  解析与封装决策、AdBlocker 规则/scheme、多链接提取分类、Zip Slip 防护、备份 JSON 往返与版本校验、
+  状态筛选计数。
+- `BackupCodec` 的纯 Kotlin 实现是"零重型依赖 + 可单测"约束的直接结果；所有新增纯逻辑模块均有 JVM 单测。
