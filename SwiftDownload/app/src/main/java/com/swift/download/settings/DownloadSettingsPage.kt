@@ -34,6 +34,7 @@ class DownloadSettingsPage(
         root.addView(categoryCard())
         root.addView(exportCard())
         root.addView(proxyCard())
+        root.addView(btCard())
 
         val close = Ui.pillBtn(context, "完成", Ui.BLUE, filled = true) { onClose() }
         root.addView(close, LinearLayout.LayoutParams(
@@ -183,6 +184,11 @@ class DownloadSettingsPage(
             sw.isChecked = settings.m3u8Enabled
             sw.setOnCheckedChangeListener { _, checked -> settings.m3u8Enabled = checked }
         })
+        // v2.7 Stage2.3：TS 完成后无重编码封装 MP4（失败自动保留 .ts）
+        card.addView(switchRowNoLabel(context, "m3u8 完成后封装 MP4") { sw ->
+            sw.isChecked = settings.autoRemuxMp4
+            sw.setOnCheckedChangeListener { _, checked -> settings.autoRemuxMp4 = checked }
+        })
         card.layoutParams = cardLp()
         return card
     }
@@ -223,6 +229,84 @@ class DownloadSettingsPage(
         card.layoutParams = cardLp()
         return card
     }
+
+    /** v2.7 Stage2.1：BT 代理类型 / 代理对 BT 生效 / 停种 / 上传限速 / 公开 Tracker */
+    private fun btCard(): View {
+        val card = Ui.card(context)
+        card.addView(Ui.text(context, "BT 下载", 15f, Ui.TXT, bold = true))
+
+        // 代理类型：点击在 HTTP / SOCKS5 间切换
+        val typeLabel = Ui.text(context, "", 13f, Ui.BLUE)
+        fun refreshType() {
+            typeLabel.text = "代理类型：" + when (settings.proxyType) {
+                com.swift.download.bt.BtConfigRules.ProxyType.HTTP -> "HTTP"
+                com.swift.download.bt.BtConfigRules.ProxyType.SOCKS5 -> "SOCKS5"
+            } + "（点击切换）"
+        }
+        refreshType()
+        typeLabel.setOnClickListener {
+            settings.proxyType = when (settings.proxyType) {
+                com.swift.download.bt.BtConfigRules.ProxyType.HTTP -> com.swift.download.bt.BtConfigRules.ProxyType.SOCKS5
+                else -> com.swift.download.bt.BtConfigRules.ProxyType.HTTP
+            }
+            refreshType()
+        }
+        card.addView(typeLabel, lpWrapTop(8f))
+
+        card.addView(switchRow(context, "代理对 BT 生效", "关闭时 BT 直连，不受 HTTP 代理影响") { sw ->
+            val cur = settings.proxyForBt ?: settings.proxyEnabled
+            sw.isChecked = cur
+            sw.setOnCheckedChangeListener { _, checked -> settings.proxyForBt = checked }
+        })
+
+        // 停种策略：点击循环 立即 → 延迟5分钟 → 一直做种
+        val seedLabel = Ui.text(context, "", 13f, Ui.BLUE)
+        fun refreshSeed() {
+            seedLabel.text = "完成后：" + when (settings.btSeedingPolicy) {
+                com.swift.download.bt.BtConfigRules.SeedingPolicy.IMMEDIATE -> "立即停种"
+                com.swift.download.bt.BtConfigRules.SeedingPolicy.DELAY_5MIN -> "延迟 5 分钟停种"
+                com.swift.download.bt.BtConfigRules.SeedingPolicy.ALWAYS -> "一直做种"
+            } + "（点击切换）"
+        }
+        refreshSeed()
+        seedLabel.setOnClickListener {
+            settings.btSeedingPolicy = when (settings.btSeedingPolicy) {
+                com.swift.download.bt.BtConfigRules.SeedingPolicy.IMMEDIATE -> com.swift.download.bt.BtConfigRules.SeedingPolicy.DELAY_5MIN
+                com.swift.download.bt.BtConfigRules.SeedingPolicy.DELAY_5MIN -> com.swift.download.bt.BtConfigRules.SeedingPolicy.ALWAYS
+                else -> com.swift.download.bt.BtConfigRules.SeedingPolicy.IMMEDIATE
+            }
+            refreshSeed()
+        }
+        card.addView(seedLabel, lpWrapTop(8f))
+
+        val upload = Ui.singleLineEt(context, "0 = 不限速").apply {
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            setText(settings.btUploadMbps.toString())
+        }
+        card.addView(upload, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = Ui.dp(context, 8f) })
+        card.addView(Ui.text(context, "上传限速 MB/s。", 11f, Ui.TXT_SUB), lpWrapTop(4f))
+
+        card.addView(switchRow(context, "自动追加公开 Tracker", "磁力任务追加精选 Tracker，加速冷门资源寻源") { sw ->
+            sw.isChecked = settings.btAutoTracker
+            sw.setOnCheckedChangeListener { _, checked -> settings.btAutoTracker = checked }
+        })
+
+        val save = Ui.pillBtn(context, "保存上传限速", Ui.BLUE, filled = true) {
+            settings.btUploadMbps = upload.text.toString().trim().toIntOrNull() ?: 0
+            Ui.toast(context, "BT 设置已保存")
+        }
+        card.addView(save, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = Ui.dp(context, 8f) })
+        card.layoutParams = cardLp()
+        return card
+    }
+
+    private fun lpWrapTop(dp: Float) = LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+    ).apply { topMargin = Ui.dp(context, dp) }
 
     private fun concurrencyCard(): View {
         val card = Ui.card(context)

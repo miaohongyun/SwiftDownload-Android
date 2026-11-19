@@ -7,8 +7,8 @@ import java.net.URL
  * 支持 master playlist 选最高码率变体；media playlist 提取分片地址。
  *
  * v2.6.0：新增 AES-128 密钥、IV 与 EXT-X-BYTERANGE 解析。
- * 仍不支持 fMP4（EXT-X-MAP）与 SAMPLE-AES 等 DRM —— 这两类会明确拒绝，
- * 而不是下出一个"已完成但播不了"的文件。
+ * v2.7：新增 EXT-X-MAP (fMP4) 初始化段解析，输出为 mp4。
+ * 仍不支持 SAMPLE-AES 等 DRM —— 这类会明确拒绝，而不是下出"完成但播不了"的文件。
  */
 object M3u8 {
 
@@ -35,6 +35,9 @@ object M3u8 {
     /** #EXT-X-BYTERANGE:<len>[@<offset>]；offset 省略时表示紧接上一个分片 */
     data class ByteRange(val length: Long, val offset: Long? = null)
 
+    /** v2.7 Stage2.3：#EXT-X-MAP fMP4 初始化段（URI + 可选 BYTERANGE） */
+    data class MapInfo(val uri: String, val byteRange: ByteRange? = null)
+
     /** 单个分片及其生效的加密/字节区间上下文 */
     data class Segment(
         val url: String,
@@ -52,7 +55,9 @@ object M3u8 {
         val items: List<Segment> = emptyList(),
         /** 非空表示该 playlist 使用了当前实现无法正确拼接的特性，应拒绝下载而不是产出坏文件 */
         val unsupported: String? = null,
-        val mediaSequence: Long = 0L
+        val mediaSequence: Long = 0L,
+        /** v2.7 Stage2.3：fMP4 初始化段（EXT-X-MAP）；非 null 时输出为 mp4 */
+        val map: MapInfo? = null
     )
 
     /** 解析 playlist 文本，[base] 为 m3u8 自身的地址，用于解析相对路径 */
@@ -65,6 +70,7 @@ object M3u8 {
         var pendingHeight = 0
         var currentKey: KeyInfo? = null
         var pendingRange: ByteRange? = null
+        var map: MapInfo? = null
         var sequence = 0L
         var nextOffset = 0L
 
@@ -90,6 +96,20 @@ object M3u8 {
                             .find(line)?.groupValues?.get(1)
                         KeyInfo(method.uppercase(), resolve(base, rawUri), iv)
                     }
+                }
+                line.startsWith("#EXT-X-MAP", ignoreCase = true) -> {
+                    // v2.7 Stage2.3：EXT-X-MAP:URI="init.mp4",BYTERANGE="728@0"
+                    val attrUri = Regex("""URI="([^"]*)"""", RegexOption.IGNORE_CASE)
+                        .find(line)?.groupValues?.get(1).orEmpty()
+                    val attrRange = Regex("""BYTERANGE="([^"]*)"""", RegexOption.IGNORE_CASE)
+                        .find(line)?.groupValues?.get(1)
+                    val range = attrRange?.let { body ->
+                        val len = body.substringBefore('@').trim().toLongOrNull() ?: 0L
+                        val at = body.indexOf('@')
+                        if (at >= 0) ByteRange(len, body.substring(at + 1).trim().toLongOrNull())
+                        else ByteRange(len, 0L) // MAP 的 BYTERANGE 无 @ 时从 0 开始
+                    }
+                    if (attrUri.isNotBlank()) map = MapInfo(resolve(base, attrUri), range)
                 }
                 line.startsWith("#EXT-X-BYTERANGE", ignoreCase = true) -> {
                     val body = line.substringAfter(':', "").trim()
@@ -124,34 +144,28 @@ object M3u8 {
             items.map { it.url },
             items,
             detectUnsupported(lines),
-            sequence
+            sequence,
+            map
         )
     }
 
     /**
      * v2.5.2：识别当前实现处理不了的 playlist；v2.6.0 起 AES-128 与 BYTERANGE 已支持，
-     * 仅 fMP4 与 SAMPLE-AES 等 DRM 仍需拒绝。
+     * v2.7 Stage2.3 起 EXT-X-MAP (fMP4) 也已支持 —— 仅 SAMPLE-AES 等 DRM 仍需拒绝。
      */
     fun detectUnsupported(lines: List<String>): String? {
         var unsupportedMethod: String? = null
-        var hasMap = false
         for (line in lines) {
-            when {
-                line.startsWith("#EXT-X-KEY", ignoreCase = true) -> {
-                    val method = Regex("""METHOD=([A-Za-z0-9-]+)""", RegexOption.IGNORE_CASE)
-                        .find(line)?.groupValues?.get(1)
-                    if (method != null && !method.equals("NONE", true) &&
-                        !method.equals("AES-128", true)
-                    ) unsupportedMethod = method.uppercase()
-                }
-                line.startsWith("#EXT-X-MAP", ignoreCase = true) -> hasMap = true
+            if (line.startsWith("#EXT-X-KEY", ignoreCase = true)) {
+                val method = Regex("""METHOD=([A-Za-z0-9-]+)""", RegexOption.IGNORE_CASE)
+                    .find(line)?.groupValues?.get(1)
+                if (method != null && !method.equals("NONE", true) &&
+                    !method.equals("AES-128", true)
+                ) unsupportedMethod = method.uppercase()
             }
         }
-        return when {
-            unsupportedMethod != null -> "分片已加密（$unsupportedMethod），当前版本仅支持 AES-128"
-            hasMap -> "fMP4 流需要 EXT-X-MAP 初始化段，当前版本无法正确合并"
-            else -> null
-        }
+        return if (unsupportedMethod != null) "分片已加密（$unsupportedMethod），当前版本仅支持 AES-128"
+        else null
     }
 
     /** master → 选中的变体地址；media → 自身首个分片（调用方一般用 segments） */

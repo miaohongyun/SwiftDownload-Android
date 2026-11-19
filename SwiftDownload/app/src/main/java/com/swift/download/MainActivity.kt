@@ -460,7 +460,11 @@ class MainActivity : AppCompatActivity() {
         showOverlay(DownloadSettingsPage(
             this,
             binder?.getSettings() ?: DownloadSettings.get(this),
-            onClose = { closeOverlay() }
+            onClose = {
+                // v2.7 Stage2.1：设置关闭后把 BT 代理/限速即时应用到会话
+                binder?.applyBtNetworkSettings()
+                closeOverlay()
+            }
         ), "下载设置")
     }
 

@@ -126,6 +126,8 @@ class DownloadService : Service() {
 
         fun setTaskLimitBps(id: Long, bps: Long) = this@DownloadService.setTaskLimitBps(id, bps)
         fun getSettings(): DownloadSettings = this@DownloadService.settings
+        /** v2.7 Stage2.1：设置变更后把 BT 代理/限速应用到会话 */
+        fun applyBtNetworkSettings() = this@DownloadService.applyBtNetworkSettings()
 
         /* v2.6.0：BT 选文件 / 顺序下载 / 就绪即播 */
         fun btFiles(id: Long): List<com.swift.download.bt.BtFile> =
@@ -198,7 +200,7 @@ class DownloadService : Service() {
 
     private class StreamSession(
         val taskId: Long,
-        val job: DownloadEngine.DownloadJob,
+        val job: DownloadEngine.DownloadJob?,  // v2.7：BT 流会话没有 HTTP Job
         val server: StreamServer
     )
 
@@ -220,11 +222,12 @@ class DownloadService : Service() {
      */
     private fun startStream(id: Long): String? {
         var t = tasks[id] ?: return null
-        if (!t.isHttp) return null
         // 已有会话且是同一任务：直接复用地址
         streamSession?.let { if (it.taskId == id) return it.server.localUrl() }
         // 换任务：结束旧会话并恢复旧任务多线程
         endStream(resume = true)
+        // v2.7 Stage2.2：BT 任务按需 piece 调度边下边播
+        if (t.isBt) return startBtStream(id, t)
         // 暂停/排队态没有 Job：先恢复任务（探测在后台线程完成）
         if (httpJobs[id] == null) resume(id)
         val job = httpJobs[id] ?: return null
@@ -254,6 +257,37 @@ class DownloadService : Service() {
     }
 
     /**
+     * v2.7 Stage2.2：BT 视频按需边下边播。选中已勾选的最大视频文件，用 TorrentBacking
+     * 按需 setPieceDeadline 调度 piece，未就绪时短轮询等待后从落盘文件读。
+     */
+    private fun startBtStream(id: Long, t: DownloadTask): String? {
+        val hash = btHashes[id] ?: return null
+        val engine = TorrentEngine.get()
+        val vf = engine.preferredVideoFile(hash) ?: return null
+        val saveBase = try { engine.find(hash)?.savePath() } catch (e: Exception) { null }
+            ?: File(t.savePath).parentFile?.absolutePath ?: return null
+        val rel = vf.path.ifBlank { vf.name }
+        val videoFile = listOf(File(saveBase, rel), File(saveBase, vf.name))
+            .firstOrNull { it.isFile } ?: return null
+        val backing = com.swift.download.bt.TorrentBacking(
+            videoFile = videoFile,
+            size = vf.size.coerceAtLeast(videoFile.length()),
+            mime = MediaTypes.mimeOf(vf.name),
+            onRequest = { offset, len ->
+                engine.scheduleVideoRange(hash, vf.index, offset, len)
+            }
+        )
+        backing.setReadyEndProvider { offset -> engine.readyEndInFile(hash, vf.index, offset) }
+        val server = StreamServer(backing)
+        val port = server.start()
+        streamSession = StreamSession(id, null, server)
+        startForegroundCompat()
+        idleSince.remove(id)
+        Log.i(TAG, "BT stream started task=$id file=${vf.name} port=$port")
+        return server.localUrl()
+    }
+
+    /**
      * v2.5：异步边下边播。探测含网络请求，不能在主线程阻塞等待，
      * 因此整个准备过程放到 IO 线程，完成后回调（回调在主线程执行）。
      */
@@ -273,7 +307,11 @@ class DownloadService : Service() {
         idleSince.remove(s.taskId)
         if (resume) {
             tasks[s.taskId]?.let { t ->
-                if (t.status != DownloadTask.Status.COMPLETED) startHttp(s.taskId)
+                if (t.status == DownloadTask.Status.COMPLETED) return@let
+                if (t.isBt) {
+                    // v2.7 Stage2.2：BT 流结束恢复做种（resume torrent）
+                    btHashes[s.taskId]?.let { TorrentEngine.get().resume(it) }
+                } else startHttp(s.taskId)
             }
         }
         notifyUi()
@@ -531,9 +569,28 @@ class DownloadService : Service() {
         }
     }
 
+    /** v2.7 Stage2.1：从设置构建 BT 网络配置并应用到会话 */
+    private fun applyBtNetworkSettings() {
+        val applies = com.swift.download.bt.BtConfigRules.proxyApplies(
+            settings.proxyEnabled, settings.proxyForBt
+        )
+        val host = if (applies) settings.proxyHost else ""
+        val type = settings.proxyType
+        TorrentEngine.get().applyNetworkConfig(
+            com.swift.download.bt.TorrentEngine.NetworkConfig(
+                proxyEnabled = applies,
+                proxyType = type,
+                proxyHost = host,
+                proxyPort = settings.proxyPort,
+                uploadLimitBps = com.swift.download.bt.BtConfigRules.uploadLimitBps(settings.btUploadMbps)
+            )
+        )
+    }
+
     override fun onCreate() {
         super.onCreate()
         settings.installProxySelector()
+        applyBtNetworkSettings()
         createChannels()
         startForegroundCompat()
         TorrentEngine.get().addListener(btListener)
@@ -780,7 +837,18 @@ class DownloadService : Service() {
             chosenVariant = t.variant.takeIf { it.isNotBlank() },
             referer = t.referer,
             cookie = t.cookie,
+            autoRemux = settings.autoRemuxMp4,
             listener = object : M3u8Job.Listener {
+                override fun onOutputPath(path: String) {
+                    // v2.7 Stage2.3：封装后扩展名/路径可能变化，同步 DB 与内存任务
+                    val cur = tasks[id] ?: return
+                    val name = File(path).name
+                    if (cur.savePath != path || cur.fileName != name) {
+                        db.updateSavePath(id, path)
+                        db.updateMeta(id, name, cur.totalBytes)
+                        tasks[id] = cur.copy(savePath = path, fileName = name)
+                    }
+                }
                 override fun onStatus(status: DownloadTask.Status) {
                     db.updateStatus(id, status)
                     tasks[id]?.let { tasks[id] = it.copy(status = status) }
@@ -869,7 +937,11 @@ class DownloadService : Service() {
         } else {
             val decision = startDecision()
             if (decision.allowed) {
-                TorrentEngine.get().addMagnet(hash, magnetUri, saveDir)
+                // v2.7 Stage2.1：可选地为磁力追加精选公开 tracker，加速冷门资源寻源
+                val effectiveUri = if (settings.btAutoTracker)
+                    com.swift.download.bt.PublicTrackers.appendToMagnet(magnetUri)
+                else magnetUri
+                TorrentEngine.get().addMagnet(hash, effectiveUri, saveDir)
                 btHashes[id] = hash
                 startForegroundCompat()
             } else {
@@ -1462,6 +1534,18 @@ class DownloadService : Service() {
     /** BT 完成唯一入口：防重、清跟踪表、单条完成通知 */
     private fun finishBtTask(id: Long, name: String) {
         if (!finishedBtIds.add(id)) return
+        // v2.7 Stage2.1：按停种策略处理做种；先取 hash（下面会清跟踪表）
+        val hash = btHashes[id]
+        when (settings.btSeedingPolicy) {
+            com.swift.download.bt.BtConfigRules.SeedingPolicy.IMMEDIATE ->
+                hash?.let { TorrentEngine.get().pause(it) }
+            com.swift.download.bt.BtConfigRules.SeedingPolicy.DELAY_5MIN ->
+                hash?.let { h -> scope.launch {
+                    delay(com.swift.download.bt.BtConfigRules.DELAY_5MIN_MS)
+                    TorrentEngine.get().pause(h)
+                } }
+            com.swift.download.bt.BtConfigRules.SeedingPolicy.ALWAYS -> { /* 一直做种 */ }
+        }
         btHashes.remove(id)
         samplers.remove(id)
         db.updateStatus(id, DownloadTask.Status.COMPLETED)

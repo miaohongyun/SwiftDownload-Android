@@ -2,6 +2,7 @@ package com.swift.download.player
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -154,14 +155,19 @@ class M3u8Test {
     }
 
     @Test
-    fun detectsFmp4InitSegment() {
+    fun parsesFmp4InitSegment() {
+        // v2.7 Stage2.3：EXT-X-MAP 现在被支持，不再拒绝；解析出绝对 URI 与 BYTERANGE
         val text = """
             #EXTM3U
-            #EXT-X-MAP:URI="init.mp4"
+            #EXT-X-MAP:URI="init.mp4",BYTERANGE="728@0"
             #EXTINF:10.0,
             seg0.m4s
         """.trimIndent()
-        assertTrue(M3u8.parse("https://site.test/v/index.m3u8", text).unsupported!!.contains("EXT-X-MAP"))
+        val p = M3u8.parse("https://site.test/v/index.m3u8", text)
+        assertNull(p.unsupported)
+        assertEquals("https://site.test/v/init.mp4", p.map?.uri)
+        assertEquals(728L, p.map?.byteRange?.length)
+        assertEquals(0L, p.map?.byteRange?.offset)
     }
 
     @Test

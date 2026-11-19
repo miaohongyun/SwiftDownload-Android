@@ -35,7 +35,9 @@ class M3u8Job(
     private val chosenVariant: String? = null,
     private val referer: String = "",
     private val cookie: String = "",
-    private val concurrency: Int = 4
+    private val concurrency: Int = 4,
+    /** v2.7 Stage2.3：TS 流完成后是否自动封装为 MP4（失败静默回退保留 TS） */
+    private val autoRemux: Boolean = false
 ) {
     interface Listener {
         fun onStatus(status: DownloadTask.Status)
@@ -47,6 +49,9 @@ class M3u8Job(
         fun onProgressDetail(
             downloaded: Long, totalEstimate: Long, doneSegments: Int, allSegments: Int
         ) {}
+
+        /** v2.7 Stage2.3：最终输出路径（可能因 fMP4/封装从 .ts 变为 .mp4），供服务同步 DB */
+        fun onOutputPath(path: String) {}
     }
 
     @Volatile private var cancelled = false
@@ -58,6 +63,9 @@ class M3u8Job(
     private fun segCache(index: Int): File = File(cacheDir(), "seg_$index.bin")
     /** 写入中残留的临时片：恢复时绝不能被当成已完成分片 */
     private fun segTemp(index: Int): File = File(cacheDir(), "seg_$index.bin.tmp")
+    /** v2.7 Stage2.3：fMP4 初始化段（EXT-X-MAP）缓存 */
+    private fun initCache(): File = File(cacheDir(), "init.mp4")
+    private fun initTemp(): File = File(cacheDir(), "init.mp4.tmp")
 
     private data class ResumeState(val assembled: Int, val bytes: Long)
 
@@ -102,6 +110,7 @@ class M3u8Job(
             }
             val items = playlist.items.ifEmpty { playlist.segments.map { M3u8.Segment(it, 0L) } }
             if (items.isEmpty()) throw IOException("playlist 中没有分片")
+            val mapInfo = playlist.map
 
             listener.onStatus(DownloadTask.Status.RUNNING)
             val part = File(savePath + ".part")
@@ -119,6 +128,21 @@ class M3u8Job(
                     assembled = 0
                     downloaded = 0L
                     raf.setLength(0L)
+                }
+
+                // v2.7 Stage2.3：fMP4 初始化段先下载到独立缓存（不污染分片索引）。
+                // EXT-X-MAP 段也可能带 AES-128 加密，密钥取首个分片的生效 key。
+                if (mapInfo != null) {
+                    val initTarget = initCache()
+                    if (!initTarget.isFile || initTarget.length() == 0L) {
+                        val initSeg = M3u8.Segment(
+                            url = mapInfo.uri,
+                            sequence = -1L,
+                            key = items.firstOrNull()?.key,
+                            byteRange = mapInfo.byteRange
+                        )
+                        downloadWithRetry(initSeg, initTemp(), initTarget)
+                    }
                 }
 
                 // 阶段一：并发拉取分片到缓存目录（不触碰 .part，恢复时可直接复用）
@@ -150,20 +174,23 @@ class M3u8Job(
                 if (failures.isNotEmpty()) throw IOException(failures.first())
 
                 // 阶段二：按序拼装。单片失败立即回滚到分片边界，状态文件同步作废。
+                // fMP4：初始化段作为文件头，仅在全新拼装（assembled==0 且未写过）时写入一次。
+                if (mapInfo != null && assembled == 0 && downloaded == 0L) {
+                    val raw = initCache().readBytes()
+                    val plain = decryptSegment(raw, items.firstOrNull()?.key, sequence = -1L)
+                    if (plain.isEmpty()) throw IOException("fMP4 初始化段为空")
+                    raf.seek(0L)
+                    raf.write(plain)
+                    downloaded = plain.size.toLong()
+                    writeState(0, downloaded)
+                }
                 raf.seek(downloaded)
                 for (i in assembled until items.size) {
                     if (cancelled) return@use
                     val cache = segCache(i)
                     if (!cache.isFile) throw IOException("分片 $i 缓存丢失")
                     val plain = try {
-                        val raw = cache.readBytes()
-                        val key = items[i].key
-                        if (key != null && key.method.equals("AES-128", true)) {
-                            val k = keyBytes(key.uri)
-                            M3u8Crypto.decrypt(
-                                raw, k, M3u8Crypto.ivFor(key.iv, items[i].sequence)
-                            )
-                        } else raw
+                        decryptSegment(cache.readBytes(), items[i].key, items[i].sequence)
                     } catch (e: Exception) {
                         throw IOException("分片 $i 解密失败：${e.message ?: "未知错误"}")
                     }
@@ -208,6 +235,39 @@ class M3u8Job(
             if (!out.isFile || out.length() != expectedLen) {
                 throw IOException("m3u8 输出文件长度异常（${out.length()} / $expectedLen）")
             }
+            // v2.7 Stage2.3：fMP4 内容本就是 mp4，改扩展名为 .mp4；
+            // 传统 TS 按设置无重编码封装为 mp4，失败静默保留 .ts，绝不因封装失败让任务失败。
+            var finalOut = out
+            val wantMp4 = mapInfo != null || autoRemux
+            if (wantMp4 && mapInfo != null) {
+                val mp4 = File(HlsMux.withExt(out.absolutePath, "mp4"))
+                if (mp4.absolutePath != out.absolutePath) {
+                    if (mp4.exists()) mp4.delete()
+                    if (out.renameTo(mp4)) finalOut = mp4
+                    else finalOut = try { out.copyTo(mp4, overwrite = true).also { out.delete() }; mp4 }
+                    catch (e: Exception) { out } // 改名失败仍保留 ts 内容
+                }
+            } else if (wantMp4 && !cancelled) {
+                val tmp = HlsMux.muxTempFile(out.absolutePath)
+                try {
+                    if (TsToMp4Muxer.remux(out, tmp) && HlsMux.isUsableMuxResult(tmp)) {
+                        val mp4 = File(HlsMux.withExt(out.absolutePath, "mp4"))
+                        if (mp4.exists()) mp4.delete()
+                        val moved = if (tmp.renameTo(mp4)) true else {
+                            try { tmp.copyTo(mp4, overwrite = true); tmp.delete(); true }
+                            catch (e: Exception) { false }
+                        }
+                        if (moved && mp4.isFile && mp4.length() > 0L) {
+                            out.delete()
+                            finalOut = mp4
+                        }
+                    }
+                } catch (e: Exception) {
+                    // 封装失败：静默保留原 .ts（临时文件由 remux 内部清理）
+                    try { tmp.delete() } catch (ignored: Exception) {}
+                }
+            }
+            listener.onOutputPath(finalOut.absolutePath)
             stateFile().delete()
             deleteCache()
             listener.onStatus(DownloadTask.Status.COMPLETED)
@@ -352,6 +412,13 @@ class M3u8Job(
         } finally {
             conn.disconnect()
         }
+    }
+
+    /** 按分片的 AES-128 上下文解密；无加密原样返回。初始化段与媒体段共用此逻辑 */
+    private fun decryptSegment(raw: ByteArray, key: M3u8.KeyInfo?, sequence: Long): ByteArray {
+        if (key == null || !key.method.equals("AES-128", true)) return raw
+        val k = keyBytes(key.uri)
+        return M3u8Crypto.decrypt(raw, k, M3u8Crypto.ivFor(key.iv, sequence))
     }
 
     /** AES-128 密钥按 URI 缓存，同一 playlist 通常共用一个 key */

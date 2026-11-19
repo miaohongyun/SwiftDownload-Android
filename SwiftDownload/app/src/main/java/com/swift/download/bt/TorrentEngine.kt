@@ -13,6 +13,7 @@ import com.frostwire.jlibtorrent.alerts.AlertType
 import com.frostwire.jlibtorrent.alerts.MetadataReceivedAlert
 import com.frostwire.jlibtorrent.alerts.TorrentAlert
 import com.frostwire.jlibtorrent.alerts.TorrentFinishedAlert
+import com.frostwire.jlibtorrent.swig.settings_pack
 import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -33,6 +34,51 @@ class TorrentEngine private constructor() {
     private val session = SessionManager()
     private val io: ExecutorService = Executors.newSingleThreadExecutor()
     @Volatile private var started = false
+
+    /** v2.7 Stage2.1：BT 网络配置（服务层从 DownloadSettings 注入） */
+    @Volatile private var netConfig: NetworkConfig = NetworkConfig()
+
+    data class NetworkConfig(
+        val proxyEnabled: Boolean = false,
+        val proxyType: BtConfigRules.ProxyType = BtConfigRules.ProxyType.HTTP,
+        val proxyHost: String = "",
+        val proxyPort: Int = 7890,
+        val uploadLimitBps: Int = 0
+    )
+
+    /**
+     * 更新 BT 网络配置并应用到会话。未启动时仅保存，ensureStarted 会读取。
+     */
+    fun applyNetworkConfig(config: NetworkConfig) {
+        netConfig = config
+        if (!started) return
+        try {
+            val sp = SettingsPack()
+            applyProxyAndRate(sp, config)
+            session.applySettings(sp)
+        } catch (e: Exception) {
+            Log.w(TAG, "applyNetworkConfig", e)
+        }
+    }
+
+    /** 把代理与上传限速写入 SettingsPack（代理关闭时清零复位） */
+    private fun applyProxyAndRate(sp: SettingsPack, c: NetworkConfig) {
+        val useProxy = c.proxyEnabled && c.proxyHost.isNotBlank()
+        if (useProxy) {
+            val ptype = when (c.proxyType) {
+                BtConfigRules.ProxyType.SOCKS5 -> settings_pack.proxy_type_t.socks5
+                BtConfigRules.ProxyType.HTTP -> settings_pack.proxy_type_t.http
+            }
+            sp.setInteger(settings_pack.int_types.proxy_type.swigValue(), ptype.swigValue())
+            sp.setString(settings_pack.string_types.proxy_hostname.swigValue(), c.proxyHost)
+            sp.setInteger(settings_pack.int_types.proxy_port.swigValue(), c.proxyPort)
+        } else {
+            sp.setInteger(settings_pack.int_types.proxy_type.swigValue(), settings_pack.proxy_type_t.none.swigValue())
+            sp.setString(settings_pack.string_types.proxy_hostname.swigValue(), "")
+            sp.setInteger(settings_pack.int_types.proxy_port.swigValue(), 0)
+        }
+        sp.uploadRateLimit(c.uploadLimitBps)
+    }
     private val listeners = ArrayList<BtListener>()
     /** v2.6.0：shutdown() 后 session 仍持有 listener，重启时不能重复 add */
     private val listenerGuard = ListenerOnceGuard()
@@ -54,6 +100,8 @@ class TorrentEngine private constructor() {
             sp.uploadRateLimit(0)
             sp.enableDht(true)
             sp.listenInterfaces("0.0.0.0:0")
+            // v2.7 Stage2.1：应用代理与上传限速（默认配置=无代理不限速，行为不变）
+            applyProxyAndRate(sp, netConfig)
             session.start(SessionParams(sp))
             session.startDht()
             listenerGuard.registerOnce { session.addListener(alertListener) }
@@ -278,6 +326,70 @@ class TorrentEngine private constructor() {
         }
         return null
     }
+
+    /* ---------------- v2.7 Stage2.2：按需边下边播（piece 调度） ---------------- */
+
+    /**
+     * 为视频文件的请求区间调度 piece：当前位置 + 预读设为 deadline=0（最高优先），
+     * 文件首尾若干 piece 也提优先级（moov/mdat 索引）。返回该区间是否已全部就绪。
+     */
+    fun scheduleVideoRange(
+        hash: String, fileIndex: Int, offsetInFile: Long, length: Int, prefetch: Int = 8
+    ): Boolean {
+        val h = find(hash) ?: return false
+        val ti = try { h.torrentFile() } catch (e: Exception) { return false } ?: return false
+        val pieceLen = ti.pieceLength()
+        val totalPieces = ti.numPieces()
+        if (pieceLen <= 0 || totalPieces <= 0) return false
+        // 文件首字节所在的全局 piece：mapFile(index, 0, 1) 得到
+        val firstPiece = try { ti.mapFile(fileIndex, 0L, 1).piece() } catch (e: Exception) { return false }
+        val range = PieceRange.covering(firstPiece, offsetInFile, length.toLong(), pieceLen, totalPieces)
+            ?: return false
+        val withRead = PieceRange.withPrefetch(range, prefetch, totalPieces)
+        return try {
+            // 首尾 piece 高优先（moov 常在头尾）
+            for (p in PieceRange.edgePieces(firstPiece, totalPieces)) {
+                h.setPieceDeadline(p, 0)
+            }
+            var allReady = true
+            for (p in withRead.first..withRead.last) {
+                h.setPieceDeadline(p, 0)
+                if (!h.havePiece(p)) allReady = false
+            }
+            allReady
+        } catch (e: Exception) {
+            Log.w(TAG, "scheduleVideoRange", e)
+            false
+        }
+    }
+
+    /**
+     * 从 offsetInFile 起连续已就绪字节的右端（绝对文件内容偏移）。
+     * 用 havePiece 判断，遇到第一个未就绪 piece 即停。
+     */
+    fun readyEndInFile(hash: String, fileIndex: Int, offsetInFile: Long): Long {
+        val h = find(hash) ?: return offsetInFile
+        val ti = try { h.torrentFile() } catch (e: Exception) { return offsetInFile } ?: return offsetInFile
+        val pieceLen = ti.pieceLength()
+        val totalPieces = ti.numPieces()
+        if (pieceLen <= 0 || totalPieces <= 0) return offsetInFile
+        val firstPiece = try { ti.mapFile(fileIndex, 0L, 1).piece() } catch (e: Exception) { return offsetInFile }
+        var piece = firstPiece + (offsetInFile / pieceLen).toInt()
+        if (piece >= totalPieces) return offsetInFile
+        var end = offsetInFile
+        while (piece < totalPieces) {
+            if (!try { h.havePiece(piece) } catch (e: Exception) { false }) break
+            end = ((piece - firstPiece + 1).toLong() * pieceLen)
+            piece++
+        }
+        val fileSize = try { ti.files().fileSize(fileIndex) } catch (e: Exception) { Long.MAX_VALUE }
+        return minOf(end, fileSize)
+    }
+
+    /** BT 视频目标文件：优先选已勾选的最大视频文件 */
+    fun preferredVideoFile(hash: String): BtFile? =
+        fileList(hash).filter { it.wanted && BtFileSelection.isVideoName(it.name) }
+            .maxByOrNull { it.size }
 
     data class BtProgress(
         val downloaded: Long,
