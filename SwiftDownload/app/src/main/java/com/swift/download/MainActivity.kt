@@ -104,10 +104,10 @@ class MainActivity : AppCompatActivity() {
     private var lastTasks: List<DownloadTask> = emptyList()
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        // v2.7 Stage4.1：锁定浅色主题，避免系统深色模式下 AlertDialog/系统控件
-        // 与硬编码浅色卡片产生文字看不清的反差。
+        // v2.7 真机修复：setDefaultNightMode 必须在 super.onCreate() 之前调用，
+        // 否则 AppCompat 会在 DecorView 建好后再 applyDayNight，可能触发 recreate 或多Inflate一次。
         AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_NO)
+        super.onCreate(savedInstanceState)
         // v2.7 Stage4.1：targetSdk 36 默认 Edge-to-Edge，关闭 decor 自动贴合，改由下面手动施加安全边距
         WindowCompat.setDecorFitsSystemWindows(window, false)
         ensureDirs()
