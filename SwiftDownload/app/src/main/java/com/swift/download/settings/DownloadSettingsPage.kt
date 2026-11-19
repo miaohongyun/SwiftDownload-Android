@@ -35,6 +35,7 @@ class DownloadSettingsPage(
         root.addView(exportCard())
         root.addView(proxyCard())
         root.addView(btCard())
+        root.addView(adBlockCard())
 
         val close = Ui.pillBtn(context, "完成", Ui.BLUE, filled = true) { onClose() }
         root.addView(close, LinearLayout.LayoutParams(
@@ -298,6 +299,34 @@ class DownloadSettingsPage(
             Ui.toast(context, "BT 设置已保存")
         }
         card.addView(save, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = Ui.dp(context, 8f) })
+        card.layoutParams = cardLp()
+        return card
+    }
+
+    /** v2.7 Stage3.1：浏览器广告拦截总开关 + 自定义规则 */
+    private fun adBlockCard(): View {
+        val card = Ui.card(context)
+        card.addView(Ui.text(context, "浏览器净化", 15f, Ui.TXT, bold = true))
+        card.addView(switchRowNoLabel(context, "拦截网页广告与恶意跳转") { sw ->
+            sw.isChecked = settings.adBlockEnabled
+            sw.setOnCheckedChangeListener { _, checked -> settings.adBlockEnabled = checked }
+        })
+        val etRules = Ui.singleLineEt(context, "每行一条：域名或含协议的地址").apply {
+            setText(settings.adBlockRules)
+        }
+        etRules.isSingleLine = false
+        etRules.maxLines = 5
+        card.addView(etRules, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = Ui.dp(context, 8f) })
+        card.addView(Ui.text(context, "内置规则已拦截常见广告/统计域名；自定义规则每行一条，# 开头为注释。", 11f, Ui.TXT_SUB),
+            lpWrapTop(4f))
+        card.addView(Ui.pillBtn(context, "保存自定义规则", Ui.BLUE, filled = true) {
+            settings.adBlockRules = etRules.text.toString()
+            Ui.toast(context, "拦截规则已保存（新页面生效）")
+        }, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = Ui.dp(context, 8f) })
         card.layoutParams = cardLp()

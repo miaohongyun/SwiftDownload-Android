@@ -130,6 +130,18 @@ class DownloadSettings private constructor(ctx: Context) {
             KEY_AUTO_RETRY, com.swift.download.settings.RetryPolicy.normalizeMax(value)
         ).apply()
 
+    /* ---------- v2.7 Stage3.1：浏览器广告拦截 ---------- */
+
+    /** 拦截网页广告与恶意跳转（默认开） */
+    var adBlockEnabled: Boolean
+        get() = prefs.getBoolean(KEY_AD_BLOCK, true)
+        set(value) = prefs.edit().putBoolean(KEY_AD_BLOCK, value).apply()
+
+    /** 用户自定义拦截规则（逐行；空行与 # 注释由 AdBlocker.normalizeRules 处理） */
+    var adBlockRules: String
+        get() = prefs.getString(KEY_AD_BLOCK_RULES, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_AD_BLOCK_RULES, value).apply()
+
     fun taskLimitBps(taskId: Long): Long = prefs.getLong("$KEY_TASK_LIMIT$taskId", 0L)
     fun setTaskLimitBps(taskId: Long, bps: Long) =
         prefs.edit().putLong("$KEY_TASK_LIMIT$taskId", bps.coerceAtLeast(0)).apply()
@@ -170,6 +182,8 @@ class DownloadSettings private constructor(ctx: Context) {
         private const val KEY_BT_UPLOAD = "bt_upload_mbps"
         private const val KEY_BT_TRACKER = "bt_auto_tracker"
         private const val KEY_AUTO_RETRY = "auto_retry_count"
+        private const val KEY_AD_BLOCK = "ad_block_enabled"
+        private const val KEY_AD_BLOCK_RULES = "ad_block_rules"
         private const val KEY_TASK_LIMIT = "task_limit_"
 
         @Volatile private var inst: DownloadSettings? = null

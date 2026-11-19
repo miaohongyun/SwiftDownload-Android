@@ -47,6 +47,20 @@ object VideoSniff {
     fun isMagnet(text: String): Boolean =
         text.startsWith("magnet:?xt=urn:btih:", ignoreCase = true)
 
+    /**
+     * v2.7 Stage3.3：链接分类（批量建任务用）。
+     * 只识别 http(s) 直链与 magnet 磁力，其它一律 NONE；供纯 JVM 单测覆盖。
+     */
+    enum class LinkKind { HTTP, MAGNET, NONE }
+    fun kindOf(url: String): LinkKind = when {
+        url.startsWith("magnet:", ignoreCase = true) -> LinkKind.MAGNET
+        url.startsWith("http://", ignoreCase = true) || url.startsWith("https://", ignoreCase = true) -> LinkKind.HTTP
+        else -> LinkKind.NONE
+    }
+
+    /** v2.7 Stage3.3：批量输入是否应切换为"识别多链接"模式（≥2 条明确链接） */
+    fun shouldBatch(text: String): Boolean = extractLinks(text).size >= 2
+
     /** 从 URL 推断一个可读的文件名 */
     fun displayName(url: String): String {
         val raw = pathOf(url).substringAfterLast('/')

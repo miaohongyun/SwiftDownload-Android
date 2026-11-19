@@ -15,15 +15,20 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.text.Editable
+import android.text.TextWatcher
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import com.swift.download.player.VideoSniff
+import com.swift.download.settings.DownloadSettings
 import com.swift.download.ui.Ui
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayInputStream
 import java.io.File
 
 /**
@@ -61,11 +66,21 @@ class BrowserPage(
 
     private val contentHost: FrameLayout
     private val tabsStrip: LinearLayout
+    private val tabsScroller: HorizontalScrollView
     private val etUrl: EditText
     private val progress: ProgressBar
     private var homepage: View
 
+    /** v2.7 Stage3.2：桌面版 UA 标志（切换后自动刷新当前页） */
+    private var desktopMode = false
+
     private val siteStore = QuickSites.get(context)
+    /** v2.7 Stage3.1：广告拦截开关与自定义规则（与设置页共享同一单例） */
+    private val settings = DownloadSettings.get(context)
+
+    /** v2.7 Stage3.1：获取用户自定义拦截规则（规范化） */
+    private fun customAdRules(): List<String> =
+        com.swift.download.browser.AdBlocker.normalizeRules(settings.adBlockRules)
 
     init {
         setBackgroundColor(Ui.BG)
@@ -87,7 +102,8 @@ class BrowserPage(
             orientation = LinearLayout.HORIZONTAL
             setPadding(Ui.dp(context, 8f), Ui.dp(context, 4f), Ui.dp(context, 8f), Ui.dp(context, 4f))
         }
-        root.addView(Ui.horizontalScroll(context, tabsStrip), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        tabsScroller = Ui.horizontalScroll(context, tabsStrip)
+        root.addView(tabsScroller, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         // 地址栏
         val bar = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
@@ -97,9 +113,28 @@ class BrowserPage(
             setOnEditorActionListener { _, actionId, _ ->
                 if (actionId == android.view.inputmethod.EditorInfo.IME_ACTION_GO) { go(); true } else false
             }
+            // v2.7 Stage3.2：聚焦自动全选，方便一键复制或覆盖输入
+            setOnFocusChangeListener { _, hasFocus -> if (hasFocus) post { selectAll() } }
         }
         val barCard = Ui.card(context, 18f)
-        barCard.addView(etUrl)
+        val urlRow = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        urlRow.addView(etUrl, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        // v2.7 Stage3.2：地址栏清空 ✕
+        val clearUrl = TextView(context).apply {
+            text = "✕"; textSize = 15f; setTextColor(Ui.TXT_SUB)
+            setPadding(Ui.dp(context, 6f), Ui.dp(context, 4f), Ui.dp(context, 4f), Ui.dp(context, 4f))
+            visibility = GONE
+            setOnClickListener { etUrl.setText(""); etUrl.requestFocus() }
+        }
+        urlRow.addView(clearUrl, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        etUrl.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                clearUrl.visibility = if (s.isNullOrEmpty()) GONE else VISIBLE
+            }
+        })
+        barCard.addView(urlRow)
         bar.addView(barCard, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         for ((label, act) in listOf<Pair<String, () -> Unit>>(
             "←" to { current?.webView?.goBack() },
@@ -107,7 +142,8 @@ class BrowserPage(
             "⟳" to { current?.webView?.reload() },
             "⌂" to { goHome() },
             "☆" to { bookmarkCurrentPage() },
-            "嗅探" to { showSniffSheet() }
+            "嗅探" to { showSniffSheet() },
+            "⋮" to { showBrowserMenu() }
         )) {
             val b = TextView(context).apply {
                 text = label; textSize = if (label == "嗅探") 12f else 18f
@@ -222,14 +258,11 @@ class BrowserPage(
         tabsStrip.removeAllViews()
         for (t in tabs) {
             val isSel = t === current
-            val chip = TextView(context).apply {
-                text = t.title.ifEmpty { "新标签页" }
-                textSize = 12f
-                maxLines = 1
-                ellipsize = android.text.TextUtils.TruncateAt.END
-                setPadding(Ui.dp(context, 14f), Ui.dp(context, 6f), Ui.dp(context, 14f), Ui.dp(context, 6f))
-                setTextColor(if (isSel) 0xFFFFFFFF.toInt() else Ui.TXT)
-                typeface = if (isSel) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+            // v2.7 Stage3.2：胶囊 = 标题 + 明显的 × 关闭按钮（× 独立热区，标题区仍可长按关闭）
+            val chip = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(Ui.dp(context, 10f), Ui.dp(context, 5f), Ui.dp(context, 2f), Ui.dp(context, 5f))
                 background = android.graphics.drawable.GradientDrawable().apply {
                     setColor(if (isSel) Ui.BLUE else 0xFFEDF0F6.toInt())
                     cornerRadius = Ui.dp(context, 14f).toFloat()
@@ -237,6 +270,23 @@ class BrowserPage(
                 setOnClickListener { switchTo(t) }
                 setOnLongClickListener { closeTab(t); true }
             }
+            val title = TextView(context).apply {
+                text = t.title.ifEmpty { "新标签页" }
+                textSize = 12f
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                setTextColor(if (isSel) 0xFFFFFFFF.toInt() else Ui.TXT)
+                typeface = if (isSel) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+            }
+            chip.addView(title, LinearLayout.LayoutParams(Ui.dp(context, 100f), ViewGroup.LayoutParams.WRAP_CONTENT))
+            val close = TextView(context).apply {
+                text = "×"; textSize = 17f; gravity = Gravity.CENTER
+                setTextColor(if (isSel) 0xFFFFFFFF.toInt() else Ui.TXT_SUB)
+                // 扩大点击热区：24dp 见方，视觉仍是一个字符
+                setPadding(Ui.dp(context, 6f), Ui.dp(context, 6f), Ui.dp(context, 6f), Ui.dp(context, 6f))
+                setOnClickListener { closeTab(t) }
+            }
+            chip.addView(close, LinearLayout.LayoutParams(Ui.dp(context, 30f), Ui.dp(context, 30f)))
             tabsStrip.addView(chip, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 marginEnd = Ui.dp(context, 6f)
             })
@@ -252,6 +302,18 @@ class BrowserPage(
             setOnClickListener { newTab() }
         }
         tabsStrip.addView(plus, LinearLayout.LayoutParams(Ui.dp(context, 28f), Ui.dp(context, 28f)))
+        // v2.7 Stage3.2：新增/切换标签后平滑滚动到当前激活胶囊
+        tabsScroller.post {
+            val selIndex = tabs.indexOfFirst { it === current }
+            if (selIndex >= 0) {
+                val child = tabsStrip.getChildAt(selIndex)
+                if (child != null) {
+                    val targetX = (child.left + child.width / 2 - tabsScroller.width / 2)
+                        .coerceAtLeast(0)
+                    tabsScroller.smoothScrollTo(targetX, 0)
+                }
+            }
+        }
     }
 
     /* ---------------- WebView ---------------- */
@@ -280,8 +342,21 @@ class BrowserPage(
         s.builtInZoomControls = true
         s.displayZoomControls = false
         s.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
-        s.userAgentString = HttpUtil.USER_AGENT
+        s.userAgentString = if (desktopMode) DESKTOP_UA else HttpUtil.USER_AGENT
         wv.setBackgroundColor(0xFFFFFFFF.toInt())
+        // v2.7 Stage3.2：长按图片/链接弹菜单；普通文本交回 WebView 默认选择行为
+        wv.setOnLongClickListener { v ->
+            val hit = (v as WebView).hitTestResult
+            if (hit.type in setOf(
+                    WebView.HitTestResult.IMAGE_TYPE,
+                    WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE,
+                    WebView.HitTestResult.SRC_ANCHOR_TYPE
+                ) && !hit.extra.isNullOrBlank()
+            ) {
+                showHitTestMenu(hit)
+                true
+            } else false
+        }
     }
 
     /** 视频嗅探：同一页面只提示一次，避免分片请求反复弹窗 */
@@ -294,6 +369,10 @@ class BrowserPage(
             request: WebResourceRequest
         ): android.webkit.WebResourceResponse? {
             val url = request.url.toString()
+            // v2.7 Stage3.1：命中广告/统计/劫持规则 → 返回空响应，直接掐断
+            if (settings.adBlockEnabled && AdBlocker.isBlocked(url, customAdRules())) {
+                return android.webkit.WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+            }
             if (VideoSniff.isCandidate(url)) {
                 val page = t.url.ifBlank { url }
                 // v2.6.0：无论是否弹窗都记录到本标签，关闭弹窗后仍可从角标重新查看
@@ -312,13 +391,24 @@ class BrowserPage(
 
         override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
             val url = request.url.toString()
+            // v2.7 Stage3.1：仅放行白名单协议；外部未知 Scheme（intent/market/weixin/alipay…）
+            // 一律拦截并轻提示，防止影视站自动弹走打开第三方 App。
             return when {
-                url.startsWith("magnet:") -> {
+                url.startsWith("magnet:", true) -> {
                     confirmMagnet(url); true
                 }
-                url.startsWith("http://") || url.startsWith("https://") -> false
-                url.startsWith("about:") -> true
-                else -> true
+                url.startsWith("http://", true) || url.startsWith("https://", true) -> {
+                    // 导航到广告域名也可拦截（站点跳转广告）
+                    if (settings.adBlockEnabled && AdBlocker.isBlocked(url, customAdRules())) {
+                        Ui.toast(context, "已拦截广告跳转")
+                        true
+                    } else false
+                }
+                url.startsWith("about:", true) -> false
+                else -> {
+                    Ui.toast(context, "已拦截外部跳转")
+                    true
+                }
             }
         }
         override fun onPageFinished(view: WebView, url: String) {
@@ -340,6 +430,25 @@ class BrowserPage(
         override fun onReceivedTitle(view: WebView, title: String?) {
             t.title = title ?: t.url
             renderTabs()
+        }
+
+        /**
+         * v2.7 Stage3.1：拦截 window.open 弹窗。
+         * 非用户意图（脚本自动弹广告）直接拒绝；用户主动点击的弹窗挂到新标签，
+         * 避免站点用弹窗跳出同步广告页。
+         */
+        override fun onCreateWindow(
+            view: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?
+        ): Boolean {
+            if (!isUserGesture) {
+                Ui.toast(context, "已拦截弹出广告窗口")
+                return false
+            }
+            val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
+            val newTab = newTab()
+            transport.webView = ensureWebView(newTab)
+            resultMsg.sendToTarget()
+            return true
         }
     }
 
@@ -467,6 +576,89 @@ class BrowserPage(
                 }
             }
         }.apply { isDaemon = true }.start()
+    }
+
+    /** v2.7 Stage3.2：地址栏 ⋮ 功能菜单（桌面版切换入口） */
+    private fun showBrowserMenu() {
+        val ctx = context
+        val items = arrayOf(
+            if (desktopMode) "切换为手机版网页" else "切换为桌面版网页",
+            "复制当前网址"
+        )
+        android.app.AlertDialog.Builder(ctx)
+            .setTitle("浏览器功能")
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> toggleDesktopMode()
+                    1 -> {
+                        val url = current?.url.orEmpty()
+                        if (url.isNotBlank() && url != HOME_URL) copyText("网址", url)
+                        else Ui.toast(ctx, "当前页没有可复制的网址")
+                    }
+                }
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** v2.7 Stage3.2：切换 UA 并刷新当前页（解决部分网盘/下载站仅桌面端显示直链） */
+    private fun toggleDesktopMode() {
+        desktopMode = !desktopMode
+        val ua = if (desktopMode) DESKTOP_UA else HttpUtil.USER_AGENT
+        // 当前已创建的 WebView 全部同步 UA；未创建的在 configure() 时按标志设置
+        for (tab in tabs) tab.webView?.settings?.userAgentString = ua
+        val wv = current?.webView
+        if (wv != null) {
+            wv.reload()
+            Ui.toast(context, if (desktopMode) "已切换桌面版，正在刷新" else "已切换手机版，正在刷新")
+        } else {
+            Ui.toast(context, if (desktopMode) "已切换桌面版（打开网页后生效）" else "已切换手机版")
+        }
+    }
+
+    private fun copyText(label: String, value: String) {
+        try {
+            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            cm.setPrimaryClip(android.content.ClipData.newPlainText(label, value))
+            Ui.toast(context, "已复制$label")
+        } catch (e: Exception) {
+            Ui.toast(context, "复制失败")
+        }
+    }
+
+    /** v2.7 Stage3.2：WebView 长按菜单（图片保存/复制地址，链接新建下载/新标签/复制） */
+    private fun showHitTestMenu(hit: WebView.HitTestResult) {
+        val ctx = context
+        val extra = hit.extra ?: return
+        when (hit.type) {
+            WebView.HitTestResult.IMAGE_TYPE, WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE -> {
+                android.app.AlertDialog.Builder(ctx)
+                    .setTitle("图片")
+                    .setItems(arrayOf("保存图片", "复制图片地址")) { _, which ->
+                        when (which) {
+                            0 -> confirmDownload(extra, VideoSniff.displayName(extra))
+                            1 -> copyText("图片地址", extra)
+                        }
+                    }
+                    .setNegativeButton("取消", null)
+                    .show()
+            }
+            WebView.HitTestResult.SRC_ANCHOR_TYPE -> {
+                android.app.AlertDialog.Builder(ctx)
+                    .setTitle("链接")
+                    .setItems(arrayOf("新建下载", "新标签打开", "复制链接")) { _, which ->
+                        when (which) {
+                            0 -> if (extra.startsWith("magnet:", true)) confirmMagnet(extra)
+                                 else confirmDownload(extra, VideoSniff.displayName(extra))
+                            1 -> newTab(extra)
+                            2 -> copyText("链接", extra)
+                        }
+                    }
+                    .setNegativeButton("取消", null)
+                    .show()
+            }
+            else -> { /* 普通文本交给 WebView 默认长按选择 */ }
+        }
     }
 
     private fun go() {
@@ -723,6 +915,10 @@ class BrowserPage(
 
     companion object {
         const val HOME_URL = "about:home"
+
+        /** v2.7 Stage3.2：桌面版 UA（网盘/下载站仅桌面端显示直链时用） */
+        const val DESKTOP_UA =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     }
 }
 

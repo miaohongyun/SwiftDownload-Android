@@ -229,7 +229,12 @@ class TransfersPage(
 
     private fun showNewTaskDialog(prefill: String = "") {
         val ctx = context
-        val et = Ui.singleLineEt(ctx, "粘贴 http/https 下载直链").apply { setText(prefill) }
+        // v2.7 Stage3.3：支持多行粘贴（不再强制单行），检测到 ≥2 条链接时提示可批量建任务
+        val et = Ui.singleLineEt(ctx, "粘贴 http/https 直链或磁力（支持多行，一次多条）").apply {
+            setText(prefill)
+            isSingleLine = false
+            maxLines = 6
+        }
         // v2.6.0：高级选项可折叠，平时不干扰"粘贴即下"的主流程
         val advanced = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL; visibility = View.GONE }
         val etName = Ui.singleLineEt(ctx, "自定义文件名（留空自动识别）")
@@ -252,8 +257,18 @@ class TransfersPage(
             orientation = LinearLayout.VERTICAL
             setPadding(Ui.dp(ctx, 20f), Ui.dp(ctx, 8f), Ui.dp(ctx, 20f), 0)
             addView(et, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-            addView(Ui.text(ctx, "支持多线程加速与断点续传，文件名自动识别。", 12f, Ui.TXT_SUB),
+            addView(Ui.text(ctx, "支持多线程加速与断点续传；可一次粘贴多条链接批量识别。", 12f, Ui.TXT_SUB),
                 LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = Ui.dp(ctx, 8f) })
+            // v2.7 Stage3.3：批量识别链接按钮
+            addView(Ui.pillBtn(ctx, "批量识别链接", Ui.BLUE, filled = true) {
+                val links = com.swift.download.player.VideoSniff.extractLinks(et.text.toString())
+                if (links.size < 2) {
+                    Ui.toast(ctx, "未识别到 2 条以上链接（支持 http/https 与 magnet）")
+                } else {
+                    showBatchConfirmDialog(links)
+                }
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = Ui.dp(ctx, 8f) })
             addView(toggle, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = Ui.dp(ctx, 8f) })
             addView(advanced, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
@@ -263,8 +278,21 @@ class TransfersPage(
             .setTitle("新建下载任务")
             .setView(wrap)
             .setPositiveButton("开始下载") { _, _ ->
-                val url = et.text.toString().trim()
-                if (url.startsWith("http://") || url.startsWith("https://")) {
+                val input = et.text.toString().trim()
+                // v2.7 Stage3.3：单条 magnet 直接建 BT 任务；多链接走批量确认
+                if (com.swift.download.player.VideoSniff.isMagnet(input)) {
+                    controller.addMagnetLink(input)
+                    Ui.toast(ctx, "磁力任务已添加")
+                    adapter.pendingClipUrl = null
+                    return@setPositiveButton
+                }
+                val links = com.swift.download.player.VideoSniff.extractLinks(input)
+                if (links.size >= 2) {
+                    showBatchConfirmDialog(links)
+                    return@setPositiveButton
+                }
+                val url = links.firstOrNull { com.swift.download.player.VideoSniff.kindOf(it) == com.swift.download.player.VideoSniff.LinkKind.HTTP }
+                if (url != null) {
                     val name = etName.text.toString().trim()
                     controller.addHttpTask(
                         url, name, threadsPref,
@@ -275,8 +303,78 @@ class TransfersPage(
                     Ui.toast(ctx, "任务已添加：${name.ifBlank { com.swift.download.nameFromUrl(url) }}")
                     adapter.pendingClipUrl = null
                 } else {
-                    Ui.toast(ctx, "请输入 http/https 开头的直链")
+                    Ui.toast(ctx, "请输入 http/https 开头的直链或 magnet 磁力")
                 }
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** v2.7 Stage3.3：批量确认列表（复选框 + 全选/反选），一键建立所有选中任务 */
+    private fun showBatchConfirmDialog(links: List<String>) {
+        val ctx = context
+        val checked = BooleanArray(links.size) { true }
+        val names = Array(links.size) { i ->
+            val kind = com.swift.download.player.VideoSniff.kindOf(links[i])
+            val tag = if (kind == com.swift.download.player.VideoSniff.LinkKind.MAGNET) "[磁力]" else "[直链]"
+            val shown = if (links[i].length > 72) links[i].take(72) + "…" else links[i]
+            "$tag $shown"
+        }
+        AlertDialog.Builder(ctx)
+            .setTitle("批量建任务 · 识别到 ${links.size} 条")
+            .setMultiChoiceItems(names, checked) { _, which, isChecked -> checked[which] = isChecked }
+            .setPositiveButton("全部下载") { _, _ ->
+                var n = 0
+                for (i in links.indices) {
+                    if (!checked[i]) continue
+                    when (com.swift.download.player.VideoSniff.kindOf(links[i])) {
+                        com.swift.download.player.VideoSniff.LinkKind.MAGNET -> controller.addMagnetLink(links[i])
+                        com.swift.download.player.VideoSniff.LinkKind.HTTP -> controller.addHttpTask(links[i], "", threadsPref)
+                        else -> continue
+                    }
+                    n++
+                }
+                Ui.toast(ctx, if (n > 0) "已添加 $n 个任务" else "未选择任何链接")
+                if (n > 0) adapter.pendingClipUrl = null
+            }
+            .setNeutralButton("反选") { _, _ ->
+                // AlertDialog 的 setNeutralButton 会关闭弹窗，反选后重新弹出以反映新选择
+                for (i in checked.indices) checked[i] = !checked[i]
+                showBatchConfirmDialogWithState(links, checked)
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** 反选后带着已有勾选状态重开确认框 */
+    private fun showBatchConfirmDialogWithState(links: List<String>, checked: BooleanArray) {
+        val ctx = context
+        val names = Array(links.size) { i ->
+            val kind = com.swift.download.player.VideoSniff.kindOf(links[i])
+            val tag = if (kind == com.swift.download.player.VideoSniff.LinkKind.MAGNET) "[磁力]" else "[直链]"
+            val shown = if (links[i].length > 72) links[i].take(72) + "…" else links[i]
+            "$tag $shown"
+        }
+        AlertDialog.Builder(ctx)
+            .setTitle("批量建任务 · 识别到 ${links.size} 条")
+            .setMultiChoiceItems(names, checked) { _, which, isChecked -> checked[which] = isChecked }
+            .setPositiveButton("全部下载") { _, _ ->
+                var n = 0
+                for (i in links.indices) {
+                    if (!checked[i]) continue
+                    when (com.swift.download.player.VideoSniff.kindOf(links[i])) {
+                        com.swift.download.player.VideoSniff.LinkKind.MAGNET -> controller.addMagnetLink(links[i])
+                        com.swift.download.player.VideoSniff.LinkKind.HTTP -> controller.addHttpTask(links[i], "", threadsPref)
+                        else -> continue
+                    }
+                    n++
+                }
+                Ui.toast(ctx, if (n > 0) "已添加 $n 个任务" else "未选择任何链接")
+                if (n > 0) adapter.pendingClipUrl = null
+            }
+            .setNeutralButton("全选") { _, _ ->
+                for (i in checked.indices) checked[i] = true
+                showBatchConfirmDialogWithState(links, checked)
             }
             .setNegativeButton("取消", null)
             .show()
