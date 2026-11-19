@@ -98,4 +98,65 @@ object AdBlocker {
         val lower = url.trim().lowercase()
         return ALLOWED_SCHEMES.any { lower.startsWith(it) }
     }
+
+    /* ---------------- v2.8 模块三：DOM 注入去悬浮广告 ---------------- */
+
+    /**
+     * 轻度隐藏规则：常见的固定定位广告容器 / 广告联盟 / 全屏透明劫持层。
+     * 选择器刻意保守，避免误伤视频播放器与分页导航。
+     */
+    val LIGHT_HIDE_SELECTORS = listOf(
+        "ins.adsbygoogle",
+        "iframe[src*='adsbygoogle']",
+        "iframe[src*='doubleclick']",
+        "div[class*='advert']",
+        "div[id*='advert']"
+    )
+
+    /** 强力模式追加：极大 z-index 的固定悬浮层 / 常见中文站悬浮广告类名 */
+    val STRONG_HIDE_SELECTORS = listOf(
+        "div[class*='popup']", "div[id*='popup']",
+        "div[class*='float-ad']", "div[class*='floating']",
+        "div[style*='position: fixed'][style*='z-index: 999']",
+        "a[href^='intent://']", "a[href^='baiduboxapp://']", "a[href^='thunder://']"
+    )
+
+    /**
+     * 生成注入到页面的 JS（纯逻辑，JVM 单测覆盖生成的字符串包含预期选择器）。
+     * 用一次性 <style> 标签隐藏匹配元素；强力模式才追加激进选择器；
+     * 同时对 intent/baiduboxapp/thunder 等非下载类广告跳转做点击拦截并轻提示。
+     */
+    fun domInjectionJs(strong: Boolean): String {
+        val selectors = if (strong) LIGHT_HIDE_SELECTORS + STRONG_HIDE_SELECTORS else LIGHT_HIDE_SELECTORS
+        val css = selectors.joinToString(",") { "$it{display:none!important}" }
+        return buildString {
+            append("(function(){")
+            append("var s=document.createElement('style');")
+            append("s.textContent=").append(jsString(css)).append(";")
+            append("document.head&&document.head.appendChild(s);")
+            // 点击劫持防御：拦截拉起第三方 App 的广告链接（magnet 与 http 正常放行）
+            append("document.addEventListener('click',function(e){")
+            append("var a=e.target.closest&&e.target.closest('a[href]');")
+            append("if(!a)return;var h=a.getAttribute('href')||'';")
+            append("if(/^(intent:|baiduboxapp:|thunder:)/i.test(h)){e.preventDefault();")
+            append("if(window.AndroidAdBlock)window.AndroidAdBlock.onBlocked('已拦截广告跳转');}")
+            append("},true);")
+            append("})();")
+        }
+    }
+
+    /** JS 字符串字面量转义（纯逻辑） */
+    fun jsString(s: String): String {
+        val sb = StringBuilder(s.length + 2).append('\'')
+        for (c in s) {
+            when (c) {
+                '\\' -> sb.append("\\\\")
+                '\'' -> sb.append("\\'")
+                '\n' -> sb.append("\\n")
+                '\r' -> sb.append("\\r")
+                else -> sb.append(c)
+            }
+        }
+        return sb.append('\'').toString()
+    }
 }

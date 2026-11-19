@@ -17,6 +17,8 @@ import com.frostwire.jlibtorrent.swig.settings_pack
 import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 
 /**
  * v2.0 新增：BT/磁力下载引擎（jlibtorrent 1.2.0.18 封装）。
@@ -32,7 +34,16 @@ class TorrentEngine private constructor() {
     }
 
     private val session = SessionManager()
-    private val io: ExecutorService = Executors.newSingleThreadExecutor()
+    /**
+     * v2.8 模块一：原 newSingleThreadExecutor 是致命缺陷 —— fetchMagnet 阻塞 20s×9 轮
+     * 占住唯一线程，期间所有 BT 操作（find/pause/progress）排队，表现为"0 B/s 卡死"。
+     * 改为缓存池：BT 操作各走独立任务，互不阻塞。
+     */
+    private val io: ExecutorService = Executors.newCachedThreadPool()
+    /** 非阻塞元数据超时计时器：只投递检查任务，不占用 io 线程睡眠 */
+    private val timeoutScheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "bt-meta-timeout").apply { isDaemon = true }
+    }
     @Volatile private var started = false
 
     /** v2.7 Stage2.1：BT 网络配置（服务层从 DownloadSettings 注入） */
@@ -95,10 +106,21 @@ class TorrentEngine private constructor() {
             val sp = SettingsPack()
             sp.activeDownloads(4)
             sp.activeLimit(8)
-            sp.connectionsLimit(200)
+            sp.connectionsLimit(MAX_CONNECTIONS)
             sp.downloadRateLimit(0)   // 不限速
             sp.uploadRateLimit(0)
+            sp.cacheSize(CACHE_SIZE_MB)
+            // v2.8 模块一：DHT/LSD/UPnP/NAT-PMP 全开 + 公共引导节点
             sp.enableDht(true)
+            sp.setBoolean(settings_pack.bool_types.enable_dht.swigValue(), true)
+            sp.setBoolean(settings_pack.bool_types.enable_lsd.swigValue(), true)
+            sp.broadcastLSD(true)
+            sp.setBoolean(settings_pack.bool_types.enable_upnp.swigValue(), true)
+            sp.setBoolean(settings_pack.bool_types.enable_natpmp.swigValue(), true)
+            // 向所有 tracker/tier 并发宣告，冷门资源寻源关键
+            sp.setBoolean(settings_pack.bool_types.announce_to_all_trackers.swigValue(), true)
+            sp.setBoolean(settings_pack.bool_types.announce_to_all_tiers.swigValue(), true)
+            sp.setString(settings_pack.string_types.dht_bootstrap_nodes.swigValue(), DHT_BOOTSTRAP)
             sp.listenInterfaces("0.0.0.0:0")
             // v2.7 Stage2.1：应用代理与上传限速（默认配置=无代理不限速，行为不变）
             applyProxyAndRate(sp, netConfig)
@@ -118,9 +140,20 @@ class TorrentEngine private constructor() {
         }
     }
 
+    /** 等待元数据的 hash 集合：METADATA_RECEIVED 到达后移除，超时任务据此判定 */
+    private val pendingMeta = java.util.Collections.newSetFromMap(
+        java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+    )
+
     /**
-     * 新增磁力任务：后台线程等待元数据（DHT 冷门资源约 1~3 分钟），到达即回填名称并开下。
-     * [hash] 为 40 位十六进制 infohash；[saveDir] 为保存目录。
+     * v2.8 模块一：新增磁力任务改为纯事件驱动。
+     *
+     * 原实现有两大致命问题：
+     *  1. session.download() 与 fetchMagnet() 双重添加句柄，DHT 命中后产生冲突；
+     *  2. fetchMagnet 是阻塞调用，在单线程池里占住线程 180 秒，期间所有 BT 操作排队卡死。
+     * 现在只调 session.download()（它本身就会连 DHT/tracker 拉元数据并开始下载），
+     * 元数据到达由 alertListener 的 METADATA_RECEIVED 回调驱动；
+     * 超时用调度器延迟检查，绝不阻塞工作线程。
      */
     fun addMagnet(hash: String, magnetUri: String, saveDir: File) {
         io.execute {
@@ -129,49 +162,26 @@ class TorrentEngine private constructor() {
                 session.download(magnetUri, saveDir)
             } catch (e: Exception) {
                 Log.w(TAG, "addMagnet", e)
-                // v2.5.2：加入会话失败必须回报，否则任务永远停在"准备就绪"
                 fireError(hash, "添加 BT 任务失败：${e.message ?: "未知错误"}")
                 return@execute
             }
-            // 元数据等待（fetchMagnet 阻塞至超时或拿到；displayName 在 session.download 内部
-            // 由 AddTorrentParams 默认填充，元数据到达后由 libtorrent 覆盖为真实名）
-            fetchMetadataLoop(hash, magnetUri)
+            // 注册非阻塞超时：180 秒后若仍无元数据才报错（真超时才报，不是轮询占线程）
+            pendingMeta.add(hash)
+            timeoutScheduler.schedule({
+                if (pendingMeta.remove(hash)) {
+                    val h = try { find(hash) } catch (e: Exception) { null }
+                    val hasMeta = h?.status()?.hasMetadata() == true
+                    if (!hasMeta) {
+                        fireError(hash, "等待种子元数据超时（${MAX_METADATA_WAIT_SECS} 秒）：未找到可用节点，请换源或检查网络/代理")
+                    }
+                }
+            }, MAX_METADATA_WAIT_SECS.toLong(), TimeUnit.SECONDS)
         }
     }
 
-    /** 冷门资源元数据慢：分多轮等待，最长 [MAX_METADATA_WAIT_SECS] */
-    private fun fetchMetadataLoop(hash: String, magnetUri: String) {
-        var waited = 0
-        while (waited < MAX_METADATA_WAIT_SECS) {
-            val data = try {
-                session.fetchMagnet(magnetUri, FETCH_CHUNK_SECS)
-            } catch (e: Exception) {
-                Log.w(TAG, "fetchMagnet", e); null
-            }
-            if (data != null && data.isNotEmpty()) {
-                try {
-                    val ti = TorrentInfo(data)
-                    fireMetadata(hash, ti.name(), ti.totalSize(), ti.numFiles())
-                } catch (e: Exception) {
-                    Log.w(TAG, "metadata parse", e)
-                }
-                return
-            }
-            // 已在下载？（同名任务已在 session 中且已有元数据）
-            val h = find(hash)
-            if (h != null && h.status().hasMetadata()) {
-                try {
-                    val ti = h.torrentFile()
-                    fireMetadata(hash, ti.name(), ti.totalSize(), ti.numFiles())
-                } catch (e: Exception) {
-                    Log.w(TAG, "metadata parse2", e)
-                }
-                return
-            }
-            waited += FETCH_CHUNK_SECS
-        }
-        // v2.5.2：元数据迟迟不到（死链/冷门资源）必须给出失败原因，而不是无限"准备就绪"
-        fireError(hash, "等待种子元数据超时（${MAX_METADATA_WAIT_SECS} 秒）：没有找到可用的节点")
+    /** 元数据到达回调：从待处理集合移除，避免超时误报 */
+    private fun onMetadataArrived(hash: String) {
+        pendingMeta.remove(hash)
     }
 
     /** 从 .torrent 文件直接添加 */
@@ -198,15 +208,45 @@ class TorrentEngine private constructor() {
         val h = find(hash) ?: return null
         if (!h.isValid()) return null
         val st = h.status()
+        val meta = st.hasMetadata()
+        // 中文状态标签：让用户一眼看出是在连节点、拉元数据还是真在下载
+        val stateLabel = when {
+            !meta -> "连接节点 · 获取元数据中"
+            st.isFinished -> "已完成 · 做种中"
+            else -> when (st.state()) {
+                com.frostwire.jlibtorrent.TorrentStatus.State.DOWNLOADING_METADATA -> "获取元数据中"
+                com.frostwire.jlibtorrent.TorrentStatus.State.DOWNLOADING -> "下载中"
+                com.frostwire.jlibtorrent.TorrentStatus.State.SEEDING -> "做种中"
+                com.frostwire.jlibtorrent.TorrentStatus.State.CHECKING_FILES -> "校验文件"
+                com.frostwire.jlibtorrent.TorrentStatus.State.ALLOCATING -> "分配磁盘空间"
+                else -> "连接节点中"
+            }
+        }
+        // Tracker / 错误诊断
+        val trackerError = try {
+            val ec = st.errorCode()
+            val msg = ec?.message().orEmpty()
+            val tracker = st.currentTracker().orEmpty()
+            when {
+                msg.isNotBlank() && tracker.isNotBlank() -> "$tracker：$msg"
+                msg.isNotBlank() -> msg
+                tracker.isNotBlank() -> "Tracker：$tracker"
+                else -> ""
+            }
+        } catch (e: Exception) { "" }
+        val dhtNodes = try { session.dhtNodes() } catch (e: Exception) { 0L }
         return BtProgress(
             downloaded = st.totalWantedDone(),
             total = st.totalWanted(),
             speedBps = st.downloadPayloadRate().toLong(),
             seeds = st.numSeeds(),
             peers = st.numPeers(),
-            hasMetadata = st.hasMetadata(),
+            hasMetadata = meta,
             finished = st.isFinished,
-            name = try { h.name() } catch (e: Exception) { "" }
+            name = try { h.name() } catch (e: Exception) { "" },
+            dhtNodes = dhtNodes,
+            stateLabel = stateLabel,
+            trackerError = trackerError
         )
     }
 
@@ -391,6 +431,11 @@ class TorrentEngine private constructor() {
         fileList(hash).filter { it.wanted && BtFileSelection.isVideoName(it.name) }
             .maxByOrNull { it.size }
 
+    /**
+     * v2.8 模块一：BT 实时诊断字段。
+     * dhtNodes/stateLabel/trackerError 让 UI 能区分"正在连节点"与"真没资源"，
+     * 不再让用户对着 0 B/s 干等。
+     */
     data class BtProgress(
         val downloaded: Long,
         val total: Long,
@@ -399,7 +444,10 @@ class TorrentEngine private constructor() {
         val peers: Int,
         val hasMetadata: Boolean,
         val finished: Boolean,
-        val name: String
+        val name: String,
+        val dhtNodes: Long = 0,
+        val stateLabel: String = "",
+        val trackerError: String = ""
     )
 
     private fun fireMetadata(hash: String, name: String, total: Long, files: Int) {
@@ -421,6 +469,7 @@ class TorrentEngine private constructor() {
             when (a) {
                 is MetadataReceivedAlert -> {
                     val hex = a.handle().infoHash().toHex()
+                    onMetadataArrived(hex)
                     val data: ByteArray? = a.torrentData()
                     if (data != null && data.isNotEmpty()) {
                         try {
@@ -445,7 +494,11 @@ class TorrentEngine private constructor() {
     companion object {
         const val TAG = "TorrentEngine"
         const val MAX_METADATA_WAIT_SECS = 180
-        const val FETCH_CHUNK_SECS = 20
+        const val MAX_CONNECTIONS = 200
+        const val CACHE_SIZE_MB = 16
+        /** v2.8 模块一：公共 DHT 引导节点，冷门资源寻源关键 */
+        const val DHT_BOOTSTRAP =
+            "router.bittorrent.com:6881,dht.transmissionbt.com:6881,router.utorrent.com:6881,dht.libtorrent.org:25401"
         @Volatile private var inst: TorrentEngine? = null
         fun get(): TorrentEngine =
             inst ?: synchronized(this) { inst ?: TorrentEngine().also { inst = it } }

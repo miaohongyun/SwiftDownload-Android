@@ -47,6 +47,8 @@ class TransfersPage(
         fun resume(id: Long)
         fun delete(id: Long, withFiles: Boolean)
         fun restart(id: Long)
+        /** v2.8 模块一：单线程重建（403/Referer 受限站点重试） */
+        fun restartSingleThread(id: Long) {}
         fun openFile(path: String)
         /** v2.2：边下边播（本地服务器接管，边播边下） */
         fun streamTask(id: Long)
@@ -84,6 +86,8 @@ class TransfersPage(
         fun httpSegmentCount(id: Long): Int = -1
         /** BT 做种/节点数；无则 null */
         fun btSeedsPeers(id: Long): Pair<Int, Int>? = null
+        /** v2.8 模块一：BT 实时诊断（DHT 节点/状态标签/tracker 错误） */
+        fun btDiagnostics(id: Long): com.swift.download.BtDiag? = null
     }
 
     private var threadsPref = 4
@@ -687,6 +691,21 @@ class TransfersPage(
                         append(" · 剩余 ").append(Format.eta((t.totalBytes - t.downloadedBytes) / spd))
                     }
                 }
+                // v2.8 模块一：BT 真实连接状态，让用户区分"连节点中"与"真没资源"
+                if (t.isBt && (st == DownloadTask.Status.PROBING || st == DownloadTask.Status.RUNNING)) {
+                    val diag = controller.btDiagnostics(t.id)
+                    if (diag != null) {
+                        val label = if (diag.stateLabel.isNotBlank()) diag.stateLabel
+                                    else if (st == DownloadTask.Status.PROBING) "等待元数据" else "下载中"
+                        append(" · ").append(label)
+                        if (diag.dhtNodes > 0 || diag.peers > 0) {
+                            append(" · DHT ").append(diag.dhtNodes).append(" / 节点 ").append(diag.peers)
+                        }
+                        if (diag.seeds > 0) append(" · 做种 ").append(diag.seeds)
+                    } else if (st == DownloadTask.Status.PROBING) {
+                        append(" · 正在连接 DHT 网络…")
+                    }
+                }
                 // v2.5：排队原因（等待 Wi-Fi / 等待时段）单独展示，
                 // 不再与失败原因混用同一个红色提示
                 if (st == DownloadTask.Status.QUEUED && t.error.isNotEmpty()) {
@@ -758,6 +777,10 @@ class TransfersPage(
                 }
                 DownloadTask.Status.FAILED -> {
                     actions.addFlow(action(ctx, "重下", Ui.BLUE, primary = true) { confirmRestart(t) })
+                    // v2.8 模块一：HTTP 失败（403/Referer）提供单线程重试入口
+                    if (t.isHttp) {
+                        actions.addFlow(action(ctx, "单线程重试", Ui.ORANGE) { controller.restartSingleThread(t.id) })
+                    }
                     // 失效直链：让用户粘贴新地址，原地替换并从头重下
                     actions.addFlow(action(ctx, "刷新链接", Ui.TXT_SUB) { showRefreshDialog(t) })
                 }
@@ -934,6 +957,12 @@ class TransfersPage(
                 row("InfoHash", t.hash, copyable = true)
                 controller.btSeedsPeers(t.id)?.let { (seeds, peers) ->
                     row("做种 / 节点", "$seeds / $peers")
+                }
+                // v2.8 模块一：BT 诊断细节（DHT 节点 / 状态 / tracker 错误）
+                controller.btDiagnostics(t.id)?.let { d ->
+                    row("DHT 节点", d.dhtNodes.toString())
+                    if (d.stateLabel.isNotBlank()) row("连接状态", d.stateLabel)
+                    if (d.trackerError.isNotBlank()) row("Tracker", d.trackerError)
                 }
             }
 

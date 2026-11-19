@@ -63,6 +63,16 @@ private const val DB_WRITE_MS = 1000L
  *  3. 重启恢复补齐 m3u8 类型，并复用原始磁力链接（保留 tracker）。
  *  4. 边下边播改为异步等待探测就绪，避免主线程阻塞。
  */
+
+/** v2.8 模块一：BT 诊断信息（纯数据，跨 Binder 传递，不暴露 jlibtorrent 类型） */
+data class BtDiag(
+    val dhtNodes: Long,
+    val stateLabel: String,
+    val trackerError: String,
+    val seeds: Int,
+    val peers: Int
+)
+
 class DownloadService : Service() {
 
     inner class DownloadBinder : Binder() {
@@ -123,6 +133,8 @@ class DownloadService : Service() {
             com.swift.download.StorageRoots.freeSpaceLabel(com.swift.download.StorageRoots.downloadRoot(this@DownloadService))
 
         fun restartTask(id: Long): Long? = this@DownloadService.restartTask(id)
+        /** v2.8 模块一：以指定线程数重建任务（单线程重试受限站点） */
+        fun restartTaskWithThreads(id: Long, threads: Int): Long? = this@DownloadService.restartTask(id, threads)
 
         fun setTaskLimitBps(id: Long, bps: Long) = this@DownloadService.setTaskLimitBps(id, bps)
         fun getSettings(): DownloadSettings = this@DownloadService.settings
@@ -156,6 +168,19 @@ class DownloadService : Service() {
             val hash = btHashes[id] ?: return null
             val p = com.swift.download.bt.TorrentEngine.get().progressOf(hash) ?: return null
             return p.seeds to p.peers
+        }
+
+        /** v2.8 模块一：BT 实时诊断（DHT 节点 / 状态标签 / tracker 错误），供任务卡与详情展示 */
+        fun btDiagnostics(id: Long): BtDiag? {
+            val hash = btHashes[id] ?: return null
+            val p = com.swift.download.bt.TorrentEngine.get().progressOf(hash) ?: return null
+            return BtDiag(
+                dhtNodes = p.dhtNodes,
+                stateLabel = p.stateLabel,
+                trackerError = p.trackerError,
+                seeds = p.seeds,
+                peers = p.peers
+            )
         }
 
         /* v2.6.0：局域网远程投递面板 */
@@ -1253,7 +1278,7 @@ class DownloadService : Service() {
      *  - m3u8 保留变体地址/来源页/文件名，不会退回 master 自动选最高码率
      *  - .torrent 任务按种子文件重建，不再被当成磁力链接（hash 为空直接失败）
      */
-    fun restartTask(id: Long): Long? {
+    fun restartTask(id: Long, threadsOverride: Int = 0): Long? {
         val t = tasks[id] ?: return null
         delete(id, withFiles = true)
         return when {
@@ -1264,7 +1289,8 @@ class DownloadService : Service() {
                 else -> null
             }
             t.isM3u8 -> addVideoTask(t.url, t.fileName, t.variant, t.referer)
-            else -> addHttpTask(t.url, t.fileName, t.threads, t.referer)
+            // v2.8 模块一：threadsOverride=1 支持 403/Referer 受限站点的单线程重试
+            else -> addHttpTask(t.url, t.fileName, if (threadsOverride > 0) threadsOverride else t.threads, t.referer)
         }
     }
 
@@ -1455,7 +1481,11 @@ class DownloadService : Service() {
                     val finishedNow = p.finished && BtTaskRules.canFinish(t.status)
                     if (finishedNow) st = DownloadTask.Status.COMPLETED
                     else if (st == DownloadTask.Status.RUNNING || st == DownloadTask.Status.PROBING) {
-                        st = DownloadTask.Status.RUNNING
+                        // v2.8 模块一：元数据未到且一点没下时保持 PROBING，
+                        // 不能翻成 RUNNING 显示"下载中 0 B/s"误导用户（实际还在连 DHT/tracker）
+                        st = if (!p.hasMetadata && p.downloaded <= 0L)
+                            DownloadTask.Status.PROBING
+                        else DownloadTask.Status.RUNNING
                     }
                     // 其它状态（暂停/排队/失败）保持原样，不被 ticker 翻回 RUNNING
                     val upd = base.copy(downloadedBytes = p.downloaded, totalBytes = total, fileName = name, status = st)

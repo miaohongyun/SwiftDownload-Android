@@ -313,6 +313,11 @@ class DownloadSettingsPage(
             sw.isChecked = settings.adBlockEnabled
             sw.setOnCheckedChangeListener { _, checked -> settings.adBlockEnabled = checked }
         })
+        // v2.8 模块三：强力去悬浮广告（默认关，避免误伤播放器/分页）
+        card.addView(switchRowNoLabel(context, "强力去除网页悬浮广告") { sw ->
+            sw.isChecked = settings.adBlockStrong
+            sw.setOnCheckedChangeListener { _, checked -> settings.adBlockStrong = checked }
+        })
         val etRules = Ui.singleLineEt(context, "每行一条：域名或含协议的地址").apply {
             setText(settings.adBlockRules)
         }

@@ -147,7 +147,8 @@ class MainActivity : AppCompatActivity() {
                 }
                 switchTo(1)
                 Ui.toast(this, "视频任务已添加")
-            }
+            },
+            onTorrentLink = { url, _, _ -> addTorrentFromUrl(url) }
         )
         transfersPage = TransfersPage(this, transferController)
         filesPage = FilesPage(this, onCast = { path -> showCastPicker(java.io.File(path).name, path) })
@@ -494,6 +495,8 @@ class MainActivity : AppCompatActivity() {
             onClose = {
                 // v2.7 Stage2.1：设置关闭后把 BT 代理/限速即时应用到会话
                 binder?.applyBtNetworkSettings()
+                // v2.8 模块三：代理变更即时应用到 WebView（全局 ProxyController）
+                try { browserPage.applyWebViewProxy() } catch (_: Exception) {}
                 closeOverlay()
             }
         ), "下载设置")
@@ -748,6 +751,10 @@ class MainActivity : AppCompatActivity() {
             // 同时彻底清除旧进度与磁盘残留，"重新下载"不会再变成"继续下载"
             binder?.restartTask(id)
         }
+        override fun restartSingleThread(id: Long) {
+            binder?.restartTaskWithThreads(id, 1)
+            Ui.toast(this@MainActivity, "已用单线程重试（适合 403 / 防盗链受限站点）")
+        }
         override fun openFile(path: String) {
             // v2.6.0：MediaStore 导出的文件用 content URI 直接唤起系统查看器，
             // FileProvider 只接受应用私有目录下的 File，对公共 Download 路径无能为力
@@ -787,6 +794,7 @@ class MainActivity : AppCompatActivity() {
         override fun freeSpaceLabel(): String = binder?.freeSpaceLabel().orEmpty()
         override fun httpSegmentCount(id: Long): Int = binder?.httpSegmentCount(id) ?: -1
         override fun btSeedsPeers(id: Long): Pair<Int, Int>? = binder?.btSeedsPeers(id)
+        override fun btDiagnostics(id: Long): BtDiag? = binder?.btDiagnostics(id)
         override fun setTaskLimit(id: Long, bps: Long) {
             binder?.setTaskLimitBps(id, bps)
         }

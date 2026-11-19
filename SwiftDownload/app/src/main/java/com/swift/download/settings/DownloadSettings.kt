@@ -142,6 +142,11 @@ class DownloadSettings private constructor(ctx: Context) {
         get() = prefs.getString(KEY_AD_BLOCK_RULES, "") ?: ""
         set(value) = prefs.edit().putString(KEY_AD_BLOCK_RULES, value).apply()
 
+    /** v2.8 模块三：强力去除网页悬浮广告（默认关，避免误伤正常页面） */
+    var adBlockStrong: Boolean
+        get() = prefs.getBoolean(KEY_AD_BLOCK_STRONG, false)
+        set(value) = prefs.edit().putBoolean(KEY_AD_BLOCK_STRONG, value).apply()
+
     fun taskLimitBps(taskId: Long): Long = prefs.getLong("$KEY_TASK_LIMIT$taskId", 0L)
     fun setTaskLimitBps(taskId: Long, bps: Long) =
         prefs.edit().putLong("$KEY_TASK_LIMIT$taskId", bps.coerceAtLeast(0)).apply()
@@ -221,6 +226,7 @@ class DownloadSettings private constructor(ctx: Context) {
         private const val KEY_AUTO_RETRY = "auto_retry_count"
         private const val KEY_AD_BLOCK = "ad_block_enabled"
         private const val KEY_AD_BLOCK_RULES = "ad_block_rules"
+        private const val KEY_AD_BLOCK_STRONG = "ad_block_strong"
         private const val KEY_TASK_LIMIT = "task_limit_"
 
         /** 参与备份的设置键白名单（不含单任务限速这类动态键） */
@@ -229,7 +235,7 @@ class DownloadSettings private constructor(ctx: Context) {
             KEY_CATEGORY, KEY_AUTO_REMUX, KEY_M3U8, KEY_MAX_CONCURRENT, KEY_EXPORT_PUBLIC,
             KEY_PROXY_ON, KEY_PROXY_HOST, KEY_PROXY_PORT, KEY_PROXY_TYPE, KEY_PROXY_BT,
             KEY_BT_SEEDING, KEY_BT_UPLOAD, KEY_BT_TRACKER, KEY_AUTO_RETRY,
-            KEY_AD_BLOCK, KEY_AD_BLOCK_RULES
+            KEY_AD_BLOCK, KEY_AD_BLOCK_RULES, KEY_AD_BLOCK_STRONG
         )
 
         @Volatile private var inst: DownloadSettings? = null

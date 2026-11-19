@@ -15,6 +15,11 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.webkit.SslErrorHandler
+import android.net.http.SslError
+import androidx.webkit.ProxyConfig
+import androidx.webkit.ProxyController
+import androidx.webkit.WebViewFeature
 import android.text.Editable
 import android.text.TextWatcher
 import android.widget.EditText
@@ -48,7 +53,9 @@ class BrowserPage(
     private val onNewMagnet: (magnetUri: String) -> Unit,
     private val onOpenMagnetSearch: (keyword: String) -> Unit,
     /** 嗅探到页面视频：master 地址、建议文件名、来源页 Referer */
-    private val onVideoDetected: (url: String, name: String, referer: String, cookie: String) -> Unit
+    private val onVideoDetected: (url: String, name: String, referer: String, cookie: String) -> Unit,
+    /** v2.8 模块一：.torrent 链接 → 拉取种子到缓存后直接建 BT 任务 */
+    private val onTorrentLink: (url: String, referer: String, cookie: String) -> Unit = { _, _, _ -> }
 ) : FrameLayout(context) {
 
     data class Tab(
@@ -71,6 +78,17 @@ class BrowserPage(
     private val progress: ProgressBar
     private var homepage: View
 
+    /** v2.8 模块二：单手体验相关（全部声明在 init 之前，遵守成员顺序铁律） */
+    /** 地址栏容器（首页展开 / 网页态收起为紧凑标题） */
+    private lateinit var addressBar: LinearLayout
+    /** 顶部紧凑标题栏（网页态显示域名/标题，点击展开地址栏） */
+    private lateinit var compactTitle: TextView
+    private var addressExpanded = false
+    /** 浏览器底部工具栏（单手拇指热区） */
+    private lateinit var bottomToolbar: LinearLayout
+    private lateinit var btnBack: TextView
+    private lateinit var btnForward: TextView
+
     /** v2.7 Stage3.2：桌面版 UA 标志（切换后自动刷新当前页） */
     private var desktopMode = false
 
@@ -83,6 +101,10 @@ class BrowserPage(
     private var sniffBadge: TextView? = null
     /** 视频嗅探：同一页面只提示一次，避免分片请求反复弹窗 */
     private var sniffKey: String? = null
+    /** v2.8 模块三：本次会话已接受的证书 host（不持久化） */
+    private val sslAcceptedHosts = java.util.Collections.newSetFromMap(
+        java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+    )
 
     private val siteStore = QuickSites.get(context)
     /** v2.7 Stage3.1：广告拦截开关与自定义规则（与设置页共享同一单例） */
@@ -115,9 +137,10 @@ class BrowserPage(
         tabsScroller = Ui.horizontalScroll(context, tabsStrip)
         root.addView(tabsScroller, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        // 地址栏
+        // 地址栏容器（v2.8：整块可折叠，网页态默认收起为紧凑标题）
+        addressBar = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
         val bar = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        etUrl = Ui.singleLineEt(context, "搜索或输入网址").apply {
+        etUrl = Ui.singleLineEt(context, "输入地址或搜索内容").apply {
             setPadding(Ui.dp(context, 12f), Ui.dp(context, 8f), Ui.dp(context, 12f), Ui.dp(context, 8f))
             imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_GO
             setOnEditorActionListener { _, actionId, _ ->
@@ -165,7 +188,24 @@ class BrowserPage(
             if (label == "嗅探") sniffBadge = b
             bar.addView(b)
         }
-        root.addView(bar)
+        addressBar.addView(bar)
+        root.addView(addressBar)
+
+        // v2.8 模块二：网页态紧凑标题栏（点击展开地址输入）
+        compactTitle = TextView(context).apply {
+            text = ""; textSize = 14f; maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
+            setTextColor(Ui.TXT)
+            setPadding(Ui.dp(context, 16f), Ui.dp(context, 12f), Ui.dp(context, 16f), Ui.dp(context, 12f))
+            visibility = GONE
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(Ui.CARD); cornerRadius = Ui.dp(context, 16f).toFloat()
+            }
+            setOnClickListener { expandAddressBar() }
+        }
+        root.addView(compactTitle, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { setMargins(Ui.dp(context, 12f), Ui.dp(context, 6f), Ui.dp(context, 12f), 0) })
 
         // 内容区
         contentHost = FrameLayout(context)
@@ -173,8 +213,153 @@ class BrowserPage(
         contentHost.addView(homepage, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         root.addView(contentHost, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
+        // v2.8 模块二：浏览器专用底部工具栏（单手拇指热区）
+        bottomToolbar = buildBottomToolbar()
+        root.addView(bottomToolbar, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+        bottomToolbar.visibility = GONE
+
         addView(root, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        applyWebViewProxy()
         newTab()
+    }
+
+    /**
+     * v2.8 模块三：让 Chromium WebView 真正走 App 设置的 HTTP 代理。
+     * 此前只设置了 HttpURLConnection 的 ProxySelector，WebView 内置网络栈完全不走代理，
+     * 导致"开了代理却依然打不开境外/屏蔽站点"。用 ProxyController 全局生效并做特性检测防低版本崩溃。
+     */
+    fun applyWebViewProxy() {
+        try {
+            if (!WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) return
+            val executor = java.util.concurrent.Executors.newSingleThreadExecutor { t ->
+                Thread(t, "wv-proxy").apply { isDaemon = true }
+            }
+            if (settings.proxyEnabled && settings.proxyHost.isNotBlank()) {
+                val rule = "http://${settings.proxyHost}:${settings.proxyPort}"
+                val config = ProxyConfig.Builder()
+                    .addProxyRule(rule)
+                    .addDirect() // 直连兜底，避免本地资源也走代理
+                    .build()
+                ProxyController.getInstance().setProxyOverride(config, executor) { }
+                Ui.toast(context, "浏览器已走代理：${settings.proxyHost}:${settings.proxyPort}")
+            } else {
+                ProxyController.getInstance().clearProxyOverride(executor) { }
+            }
+            executor.shutdown()
+        } catch (e: Exception) {
+            android.util.Log.w("BrowserPage", "applyWebViewProxy", e)
+        }
+    }
+
+    /** v2.8 模块二：底部工具栏（后退/前进/刷新/添加书签/首页或标签） */
+    private fun buildBottomToolbar(): LinearLayout {
+        val ctx = context
+        val bar = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(Ui.CARD)
+            setPadding(Ui.dp(ctx, 8f), Ui.dp(ctx, 8f), Ui.dp(ctx, 8f), Ui.dp(ctx, 8f))
+        }
+        fun tool(glyph: String, act: () -> Unit): TextView = TextView(ctx).apply {
+            text = glyph; textSize = 20f; gravity = Gravity.CENTER
+            setTextColor(Ui.BLUE)
+            setPadding(Ui.dp(ctx, 12f), Ui.dp(ctx, 10f), Ui.dp(ctx, 12f), Ui.dp(ctx, 10f))
+            Ui.pressable(this)
+            setOnClickListener { act() }
+        }
+        btnBack = tool("←") { current?.webView?.goBack() }
+        btnForward = tool("→") { current?.webView?.goForward() }
+        bar.addView(btnBack, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        bar.addView(btnForward, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        bar.addView(tool("↻") { current?.webView?.reload() },
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        bar.addView(tool("☆") { bookmarkCurrentPage() },
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        // 第5键：单击回首页，长按弹出多标签管理
+        val homeTab = tool("⌂") { goHome() }
+        homeTab.setOnLongClickListener { showTabManager(); true }
+        bar.addView(homeTab, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        return bar
+    }
+
+    /** 网页态点击紧凑标题：展开完整地址栏便于输入 */
+    private fun expandAddressBar() {
+        addressExpanded = true
+        compactTitle.visibility = GONE
+        addressBar.visibility = VISIBLE
+        etUrl.setText(current?.url?.takeIf { it != HOME_URL }.orEmpty())
+        etUrl.requestFocus()
+        etUrl.selectAll()
+    }
+
+    /** 收起地址栏回到紧凑标题（go / 失焦时调用） */
+    private fun collapseAddressBar() {
+        if (!addressExpanded) return
+        addressExpanded = false
+        etUrl.clearFocus()
+        addressBar.visibility = GONE
+        compactTitle.visibility = if (isWebMode()) VISIBLE else GONE
+    }
+
+    /** 是否处于网页浏览态 */
+    private fun isWebMode(): Boolean {
+        val u = current?.url
+        return u != null && u != HOME_URL && u.isNotBlank()
+    }
+
+    /**
+     * v2.8 模块二：根据首页/网页态统一切换 chrome（地址栏/紧凑标题/标签条/底部工具栏）。
+     * 首页：完整地址栏 + 标签条 + 隐藏底部工具栏；
+     * 网页态：标签条收起、地址栏默认收起为紧凑标题、显示底部工具栏。
+     */
+    private fun applyChromeMode() {
+        val web = isWebMode()
+        homepage.visibility = if (web) GONE else VISIBLE
+        bottomToolbar.visibility = if (web) VISIBLE else GONE
+        tabsStrip.visibility = if (web) GONE else VISIBLE
+        (tabsStrip.parent as? View)?.visibility = if (web) GONE else VISIBLE
+        if (web) {
+            if (addressExpanded) {
+                addressBar.visibility = VISIBLE
+                compactTitle.visibility = GONE
+            } else {
+                addressBar.visibility = GONE
+                compactTitle.visibility = VISIBLE
+                compactTitle.text = current?.title?.takeIf { it.isNotBlank() }
+                    ?: current?.url?.let { it.removePrefix("https://").removePrefix("http://").substringBefore('/') }
+                    ?: "网页"
+            }
+            refreshNavButtons()
+        } else {
+            addressExpanded = false
+            addressBar.visibility = VISIBLE
+            compactTitle.visibility = GONE
+        }
+    }
+
+    /** 底部工具栏前进/后退按钮置灰 */
+    private fun refreshNavButtons() {
+        val wv = current?.webView
+        fun dim(tv: TextView, enabled: Boolean) {
+            tv.setTextColor(if (enabled) Ui.BLUE else 0xFFC9CED8.toInt())
+            tv.isEnabled = enabled
+        }
+        dim(btnBack, wv?.canGoBack() == true)
+        dim(btnForward, wv?.canGoForward() == true)
+    }
+
+    /** v2.8 模块二：多标签管理底部面板（切换/新建/关闭） */
+    private fun showTabManager() {
+        val ctx = context
+        val names = tabs.map { it.title.ifEmpty { "新标签页" } }.toTypedArray()
+        android.app.AlertDialog.Builder(ctx)
+            .setTitle("标签（${tabs.size}）· 长按项关闭")
+            .setItems(names) { _, which -> switchTo(tabs[which]) }
+            .setPositiveButton("新建标签") { _, _ -> newTab() }
+            .setNeutralButton("关闭当前") { _, _ -> closeTab(current ?: return@setNeutralButton) }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     /* ---------------- 标签管理 ---------------- */
@@ -251,14 +436,13 @@ class BrowserPage(
         refreshSniffBadge()
         renderTabs()
         if (t.url == HOME_URL || t.url.isBlank()) {
-            homepage.visibility = VISIBLE
             etUrl.setText("")
-            etUrl.hint = "搜索或输入网址"
+            etUrl.hint = "输入地址或搜索内容"
         } else {
-            homepage.visibility = GONE
             etUrl.setText(t.url)
             ensureWebView(t)
         }
+        applyChromeMode()
     }
 
     private fun renderTabs() {
@@ -343,7 +527,11 @@ class BrowserPage(
     private fun configure(wv: WebView) {
         val s: WebSettings = wv.settings
         s.javaScriptEnabled = true            // 图片站/普通站都依赖
+        // v2.8 模块三：完整现代 WebView 能力（部分影视站依赖 Database/多窗口）
+        @Suppress("DEPRECATION")
+        s.databaseEnabled = true
         s.domStorageEnabled = true
+        s.loadsImagesAutomatically = true
         s.useWideViewPort = true
         s.loadWithOverviewMode = true
         s.builtInZoomControls = true
@@ -419,14 +607,73 @@ class BrowserPage(
             t.url = url
             t.title = view.title ?: url
             if (t === current) {
-                homepage.visibility = if (url == HOME_URL) VISIBLE else GONE
                 etUrl.setText(if (url == HOME_URL) "" else url)
                 renderTabs()
+                applyChromeMode()
             }
+            // v2.8 模块三：广告 DOM 注入（开关开启时，页面加载完成后注入一次）
+            if (settings.adBlockEnabled && !url.startsWith("about:")) {
+                view.evaluateJavascript(AdBlocker.domInjectionJs(settings.adBlockStrong), null)
+            }
+        }
+
+        /** v2.8 模块三：证书错误不再静默白屏，询问用户并记住本次会话选择 */
+        override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
+            if (sslAcceptedHosts.contains(t.url.removePrefix("https://").substringBefore('/'))) {
+                handler.proceed(); return
+            }
+            android.app.AlertDialog.Builder(context)
+                .setTitle("证书安全提示")
+                .setMessage("该站点证书存在问题（${sslErrorLabel(error)}），继续访问可能被监听。是否仍要继续？")
+                .setPositiveButton("继续访问") { _, _ ->
+                    sslAcceptedHosts.add(t.url.removePrefix("https://").substringBefore('/'))
+                    handler.proceed()
+                }
+                .setNegativeButton("停止加载") { _, _ -> handler.cancel() }
+                .show()
+        }
+
+        /** v2.8 模块三：主框架加载失败时展示内置错误页与快捷引导 */
+        override fun onReceivedError(view: WebView, request: WebResourceRequest, error: android.webkit.WebResourceError) {
+            if (!request.isForMainFrame) return
+            val reason = when (error.errorCode) {
+                -2 -> "DNS 解析失败"
+                -3 -> "连接超时"
+                -6 -> "连接被重置"
+                -1 -> "请求被拦截或超时"
+                else -> "加载失败（错误码 ${error.errorCode}）"
+            }
+            view.loadUrl(errorPage(reason, request.url.toString()))
         }
     }
 
-    private fun chrome(t: Tab) = object : WebChromeClient() {
+    private fun sslErrorLabel(e: SslError): String = when (e.primaryError) {
+        SslError.SSL_EXPIRED -> "已过期"
+        SslError.SSL_IDMISMATCH -> "域名不匹配"
+        SslError.SSL_NOTYETVALID -> "尚未生效"
+        SslError.SSL_UNTRUSTED -> "不受信任"
+        else -> "未知问题"
+    }
+
+    /** 内置错误引导页（data URI，含刷新/检查代理/改书签三个入口） */
+    private fun errorPage(reason: String, failedUrl: String): String {
+        val title = "网页加载失败"
+        val html = """
+            <!doctype html><meta charset=utf-8>
+            <body style="font-family:system-ui;padding:32px;color:#1f2937;background:#f6f7fb">
+            <h2 style="color:#dc2626">$title</h2>
+            <p>$reason</p>
+            <p style="color:#6b7280;font-size:12px;word-break:break-all">$failedUrl</p>
+            <p style="margin-top:24px">
+            <button onclick="history.go(0)" style="padding:10px 18px;margin-right:8px">刷新重试</button>
+            <button onclick="alert('请到 我的 → 下载设置 → HTTP 代理 检查开关与地址')" style="padding:10px 18px">检查代理</button>
+            </p></body>"""
+        val encoded = android.util.Base64.encodeToString(html.toByteArray(), android.util.Base64.NO_WRAP)
+        return "data:text/html;base64,$encoded"
+    }
+
+    /** 显式返回类型，避免 onCreateWindow 内部递归调用 chrome() 时编译器类型推断死循环 */
+    private fun chrome(t: Tab): WebChromeClient = object : WebChromeClient() {
         override fun onProgressChanged(view: WebView, newProgress: Int) {
             progress.visibility = if (newProgress in 1..99) VISIBLE else GONE
             progress.progress = newProgress
@@ -444,24 +691,63 @@ class BrowserPage(
         override fun onCreateWindow(
             view: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?
         ): Boolean {
+            // v2.8 模块三：用户手势的 target=_blank 必须放行（电影详情/磁力按钮常用），
+            // 绝不能当广告吞掉；只拦脚本自动弹窗。
             if (!isUserGesture) {
                 Ui.toast(context, "已拦截弹出广告窗口")
                 return false
             }
             val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
-            val newTab = newTab()
-            transport.webView = ensureWebView(newTab)
+            val nt = newTab()
+            // 给 transport WebView 附加一个纯监听 client：捕获目标 URL 回填到标签，
+            // 解决部分站点 target=_blank 打开后标题/地址不同步、后续导航失效的问题。
+            val wv = WebView(context).apply {
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.userAgentString = if (desktopMode) DESKTOP_UA else HttpUtil.USER_AGENT
+                webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(v: WebView, url: String) {
+                        nt.url = url; nt.title = v.title ?: url
+                        if (nt === current) applyChromeMode()
+                        renderTabs()
+                    }
+                }
+                webChromeClient = chrome(nt)
+                setDownloadListener(dl())
+            }
+            nt.webView = wv
+            contentHost.addView(wv, ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
+            ))
+            wv.visibility = if (nt === current) VISIBLE else GONE
+            transport.webView = wv
             resultMsg.sendToTarget()
             return true
         }
     }
 
     /** 页面内下载请求 → 多线程引擎（弹确认） */
-    private fun dl() = DownloadListener { url, _, contentDisposition, _, _ ->
+    private fun dl() = DownloadListener { url, _, contentDisposition, mimeType, _ ->
         val name = com.swift.download.Format.fileNameFromDisposition(contentDisposition)
             ?: com.swift.download.nameFromUrl(url)
+        // v2.8 模块一：.torrent 种子直接建 BT 任务，不再当普通文件存 Download 完事
+        if (isTorrentLink(url, name, mimeType)) {
+            android.app.AlertDialog.Builder(context)
+                .setTitle("种子文件")
+                .setMessage("$name\n\n将拉取种子并开始 BT 下载。")
+                .setPositiveButton("下载") { _, _ -> onTorrentLink(url, current?.url.orEmpty(), cookieFor(url)) }
+                .setNegativeButton("取消", null)
+                .show()
+            return@DownloadListener
+        }
         confirmDownload(url, name)
     }
+
+    /** v2.8 模块一：判定 .torrent 链接（路径后缀 / Content-Disposition / mimeType） */
+    private fun isTorrentLink(url: String, name: String, mimeType: String?): Boolean =
+        url.substringBefore('?').endsWith(".torrent", ignoreCase = true) ||
+        name.endsWith(".torrent", ignoreCase = true) ||
+        (mimeType?.contains("x-bittorrent", ignoreCase = true) == true)
 
     /**
      * v2.6.0：从 WebView 的 CookieManager 抓取目标地址与来源页的登录态。
@@ -681,19 +967,20 @@ class BrowserPage(
                 showWeb(t, "https://www.bing.com/search?q=${java.net.URLEncoder.encode(input, "UTF-8")}")
             }
         }
+        addressExpanded = false
+        etUrl.clearFocus()
     }
 
     /** 打开网页：隐藏首页，并确保当前标签的 WebView 真的可见（可能是从首页返回的旧 WebView） */
     private fun showWeb(t: Tab, url: String) {
-        homepage.visibility = GONE
         val wv = ensureWebView(t)
         wv.visibility = VISIBLE
         wv.loadUrl(url)
+        applyChromeMode()
     }
 
     private fun goHome() {
         val t = current ?: return
-        homepage.visibility = VISIBLE
         // v2.5.2：只把首页设为 VISIBLE 是不够的 —— 当前标签的 WebView 仍盖在上面，
         // 表现就是"点主页没反应，还是旧页面"
         for (tab in tabs) tab.webView?.visibility = GONE
@@ -701,6 +988,7 @@ class BrowserPage(
         t.url = HOME_URL
         t.title = "新标签页"
         renderTabs()
+        applyChromeMode()
     }
 
     /** v2.1：地址栏☆ —— 把当前页收藏为书签（存在则改名） */
@@ -722,65 +1010,34 @@ class BrowserPage(
 
     /* ---------------- 首页 ---------------- */
 
+    /**
+     * v2.8 模块二：首页极简重塑。
+     * 地址栏本身就是顶部搜索胶囊（首页态常驻），首页内只保留"磁力搜"按钮 + 3 列书签网格，
+     * 删除大段冗余提示文案与多行堆叠。
+     */
     private fun buildHomepage(): View {
         val ctx = context
         val root = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
 
-        // 搜索卡
-        val searchCard = Ui.card(ctx, 26f)
-        val searchRow = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        val etHome = Ui.singleLineEt(ctx, "搜索网页，或输入磁力关键词后选磁力引擎")
-        searchRow.addView(etHome, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        val goBtn = TextView(ctx).apply {
-            text = "搜索"; textSize = 14f; setTextColor(0xFFFFFFFF.toInt()); typeface = Typeface.DEFAULT_BOLD
+        // 磁力搜按钮（靠右，紧接顶部地址栏）
+        val magBtn = TextView(ctx).apply {
+            text = "🧲 磁力搜"; textSize = 13f; setTextColor(Ui.BLUE)
             gravity = Gravity.CENTER
+            setPadding(Ui.dp(ctx, 14f), Ui.dp(ctx, 8f), Ui.dp(ctx, 14f), Ui.dp(ctx, 8f))
             background = android.graphics.drawable.GradientDrawable().apply {
-                setColor(Ui.BLUE); cornerRadius = Ui.dp(ctx, 20f).toFloat()
+                setColor(Ui.BLUE_LIGHT); cornerRadius = Ui.dp(ctx, 18f).toFloat()
             }
-            setOnClickListener {
-                val kw = etHome.text.toString().trim()
-                if (kw.isEmpty()) return@setOnClickListener
-                etUrl.setText(kw)
-                go()
-            }
+            Ui.pressable(this)
+            setOnClickListener { onOpenMagnetSearch("") }
         }
-        searchRow.addView(goBtn, LinearLayout.LayoutParams(Ui.dp(ctx, 80f), Ui.dp(ctx, 40f)).apply { marginStart = Ui.dp(ctx, 8f) })
-        searchCard.addView(searchRow)
-        searchCard.addView(
-            Ui.text(ctx, "支持 http/https 直链、magnet 磁力链接与普通关键词", 11f, Ui.TXT_SUB),
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = Ui.dp(ctx, 6f) }
-        )
-        root.addView(searchCard, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-            setMargins(Ui.dp(ctx, 14f), Ui.dp(ctx, 16f), Ui.dp(ctx, 14f), Ui.dp(ctx, 10f))
-        })
+        root.addView(magBtn, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { gravity = Gravity.END; setMargins(Ui.dp(ctx, 16f), Ui.dp(ctx, 12f), Ui.dp(ctx, 16f), Ui.dp(ctx, 4f)) })
 
-        // 引擎入口
-        val engines = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
-        val webEngine = engineCard(ctx, "网页引擎", "必应搜索") {
-            val kw = etHome.text.toString().trim()
-            if (kw.isEmpty()) { Ui.toast(ctx, "先输入关键词") } else { etUrl.setText(kw); go() }
-        }
-        val magnetEngine = engineCard(ctx, "磁力引擎", "聚合 5 大磁力站") {
-            onOpenMagnetSearch(etHome.text.toString().trim())
-        }
-        engines.addView(webEngine, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = Ui.dp(ctx, 10f) })
-        engines.addView(magnetEngine, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        root.addView(engines, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-            setMargins(Ui.dp(ctx, 14f), 0, Ui.dp(ctx, 14f), Ui.dp(ctx, 10f))
-        })
-
-        // 书签区（v2.1：即自定义网站/书签，可在首页与「我的→书签管理」增删改）
-        root.addView(Ui.text(ctx, "书签", 13f, Ui.TXT_SUB, bold = true),
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                setMargins(Ui.dp(ctx, 18f), Ui.dp(ctx, 4f), Ui.dp(ctx, 18f), Ui.dp(ctx, 6f))
-            })
-        root.addView(Ui.text(ctx, "点击打开 · 长按编辑/置顶/删除 · 地址栏☆可收藏当前页", 11f, 0xFF9CA3AF.toInt()),
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                setMargins(Ui.dp(ctx, 18f), 0, Ui.dp(ctx, 18f), Ui.dp(ctx, 6f))
-            })
+        // 书签区：3 列纯白圆角方块网格（圆形首字母 + 站点名）
         val sitesGrid = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
         root.addView(sitesGrid, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-            setMargins(Ui.dp(ctx, 14f), 0, Ui.dp(ctx, 14f), Ui.dp(ctx, 20f))
+            setMargins(Ui.dp(ctx, 14f), Ui.dp(ctx, 6f), Ui.dp(ctx, 14f), Ui.dp(ctx, 20f))
         })
         renderSites(sitesGrid)
 
@@ -841,21 +1098,29 @@ class BrowserPage(
     }
 
     private fun siteCard(ctx: Context, site: QuickSites.Site): View {
-        val card = Ui.card(ctx, 14f)
+        // v2.8 模块二：纯白圆角方块 + 居中圆形首字母 + 名称
+        val card = Ui.card(ctx, 16f).apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(Ui.dp(ctx, 8f), Ui.dp(ctx, 14f), Ui.dp(ctx, 8f), Ui.dp(ctx, 12f))
+        }
         Ui.pressable(card)
         val iv = TextView(ctx).apply {
             text = site.name.take(1)
-            textSize = 22f
+            textSize = 20f
             gravity = Gravity.CENTER
             setTextColor(0xFFFFFFFF.toInt())
             typeface = Typeface.DEFAULT_BOLD
             background = android.graphics.drawable.GradientDrawable().apply {
-                setColor(Ui.colorOf(site.name)); cornerRadius = Ui.dp(ctx, 12f).toFloat()
+                setColor(Ui.colorOf(site.name)); cornerRadius = Ui.dp(ctx, 22f).toFloat() // 圆形
             }
         }
-        card.addView(iv, LinearLayout.LayoutParams(Ui.dp(ctx, 40f), Ui.dp(ctx, 40f)))
-        card.addView(Ui.text(ctx, site.name, 13f, Ui.TXT, bold = true), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-            topMargin = Ui.dp(ctx, 6f)
+        card.addView(iv, LinearLayout.LayoutParams(Ui.dp(ctx, 44f), Ui.dp(ctx, 44f)))
+        val nameTv = Ui.text(ctx, site.name, 12f, Ui.TXT, bold = true)
+        nameTv.gravity = Gravity.CENTER
+        nameTv.maxLines = 1
+        nameTv.ellipsize = android.text.TextUtils.TruncateAt.END
+        card.addView(nameTv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = Ui.dp(ctx, 8f)
         })
         card.setOnClickListener {
             val t = current ?: newTab()
@@ -973,8 +1238,9 @@ class QuickSites private constructor(private val ctx: Context) {
     private val defaults = listOf(
         Site("必应", "https://www.bing.com"),
         Site("电影港", "https://www.dygang.cc"),
-        Site("高清族", "https://www.gaoqingzu.com"),
-        Site("SHB影视", "https://www.shb3.com")
+        // v2.8 模块二：更新失效域名（高清族换新域，移除长期打不开的 SHB）
+        Site("高清族", "https://hdzu.cc"),
+        Site("磁力搜", "https://www.bing.com/search?q=magnet")
     )
 
     fun all(): List<Site> {
