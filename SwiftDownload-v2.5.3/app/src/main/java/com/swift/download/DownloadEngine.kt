@@ -42,7 +42,9 @@ class DownloadEngine private constructor() {
     data class ProbeResult(
         val totalBytes: Long,          // -1 表示未知（v1.0 语义）
         val acceptRanges: Boolean,
-        val fileName: String?
+        val fileName: String?,
+        /** v2.6.0：重定向后的最终地址，分段请求直接用它，避免每段重复跳一次 */
+        val finalUrl: String = ""
     )
 
     /** 分段切割计算（纯函数，单元测试覆盖） */
@@ -65,6 +67,27 @@ class DownloadEngine private constructor() {
                 start += len
             }
             return out
+        }
+
+        /**
+         * v2.6.0 Work Stealing：把慢分段 [start, end] 从"当前下载前沿"一分为二。
+         * 返回 (原段收缩后的闭区间终点, 新段起点, 新段终点)；剩余不足 [minBytes] 时返回 null。
+         * [counted] 为慢分段已下载字节（相对 start），必须 >= 0。
+         *
+         * 切分点严格大于当前前沿，保证慢段线程收缩后不会写过头；
+         * 两个分段合起来仍精确覆盖原区间，不重叠、不留洞。
+         */
+        fun stealSplit(start: Long, end: Long, counted: Long, minBytes: Long = 256 * 1024L): LongArray? {
+            if (end <= start || counted < 0L) return null
+            val total = end - start + 1
+            if (counted >= total) return null
+            val remaining = total - counted
+            if (remaining <= minBytes) return null
+            val splitRel = counted + remaining / 2
+            val shrunkEnd = start + splitRel
+            val newStart = shrunkEnd + 1
+            if (newStart > end || shrunkEnd <= start + counted) return null
+            return longArrayOf(shrunkEnd, newStart, end)
         }
 
         fun progFileName(taskId: Long): String = "$taskId.swiftprog"
@@ -111,8 +134,46 @@ class DownloadEngine private constructor() {
         /** 只允许一次"校验 + 合并 + 完成"结算 */
         private val finishing = AtomicBoolean(false)
         @Volatile private var pool: ExecutorService? = null
+        /** v2.6.0：边播回写复用的 .part 句柄 + 它的锁 */
+        private val writeLock = Any()
+        @Volatile private var writeRaf: RandomAccessFile? = null
+        /**
+         * v2.6.0 Work Stealing：保护"分段进度推进 + 慢段切分"的复合操作。
+         * 切分方在锁内收缩 segEnds 并登记新分段，慢段线程在锁内按收缩后的终点截断计数，
+         * 两者串行后就不会出现"慢段多算字节导致验收失败"。
+         */
+        private val stealLock = Any()
+        private val stealCount = AtomicLong(0)
+
+        /** 单测可观测：实际发生的慢段接管次数 */
+        fun stealEvents(): Long = stealCount.get()
         @Volatile var working = DownloadTask.Status.PROBING
             private set
+
+        /** 统一收口线程池释放；now=true 用于失败/取消，立即中断残留线程 */
+        private fun shutdownPool(now: Boolean) {
+            val p = pool ?: return
+            if (now) p.shutdownNow() else p.shutdown()
+        }
+
+        private fun openWriteRaf(t: DownloadTask): RandomAccessFile {
+            val f = File(t.savePath + ".part")
+            f.parentFile?.mkdirs()
+            return RandomAccessFile(f, "rw")
+        }
+
+        /** 合并/取消前关闭回写句柄，避免 Windows 上 rename/delete 失败 */
+        private fun closeWriteRaf() {
+            val raf = synchronized(writeLock) {
+                val r = writeRaf
+                writeRaf = null
+                r
+            }
+            try { raf?.close() } catch (e: Exception) {}
+        }
+
+        /** 单测可观测：线程池是否已关闭（尚未创建视为无泄漏） */
+        fun isPoolShutdown(): Boolean = pool?.isShutdown ?: true
 
         fun start() {
             working = DownloadTask.Status.PROBING
@@ -132,14 +193,33 @@ class DownloadEngine private constructor() {
         /** 探测 + 分段准备（后台线程） */
         private fun prepare() {
             try {
-                val probe = probe(task.url, task.referer)
+                val probe = probe(task.url, task.referer, task.cookie, task.userAgent)
                 if (cancelled.get()) return
+                val sourceUrl = probe.finalUrl.ifBlank { task.url }
                 if (probe.totalBytes <= 0L) {
-                    working = DownloadTask.Status.FAILED
-                    listener.onError(
-                        task.copy(status = working),
-                        "无法获取文件大小（服务器未返回 Content-Length）"
+                    // v2.6.0：未知长度（Chunked / 无 Content-Length）不再是错误。
+                    // 没有总长度就没有分段边界和断点语义，所以单线程从头写到 EOF，
+                    // 完成后把实际字节数写回 totalBytes 再走同一套合并验收。
+                    val serverName = probe.fileName?.let { sanitizeFileName(it) }.orEmpty()
+                    val finalName = if (serverName.isNotBlank()) {
+                        val dir = File(task.savePath).parentFile ?: File(".")
+                        avoidNameCollision(dir, serverName, task.savePath)
+                    } else task.fileName
+                    val savePath = if (finalName != task.fileName) {
+                        File(File(task.savePath).parentFile ?: File("."), finalName).absolutePath
+                    } else task.savePath
+                    if (savePath != task.savePath) clearStaleParts(task.savePath, savePath)
+                    val streamTask = task.copy(
+                        url = sourceUrl, totalBytes = -1L,
+                        fileName = finalName, savePath = savePath
                     )
+                    working = DownloadTask.Status.RUNNING
+                    listener.onStatus(streamTask.copy(status = working))
+                    pool = Executors.newFixedThreadPool(1)
+                    val counter = AtomicLong(0L)
+                    segEnds[0L] = -1L
+                    segCounters[0L] = counter
+                    pool?.execute { streamUnknownLength(streamTask, counter) }
                     return
                 }
                 // 断点数据是否可用：进度文件存在、服务器总大小与上次一致，且分段布局仍然匹配
@@ -175,11 +255,19 @@ class DownloadEngine private constructor() {
                 val serverName = probe.fileName?.let { sanitizeFileName(it) }.orEmpty()
                 val canRename = task.downloadedBytes <= 0L && !hasResume &&
                     serverName.isNotBlank()
-                val finalName = if (canRename) serverName else task.fileName
+                // v2.6.0：Content-Disposition 给出的名字可能与别的任务撞车。
+                // 直接覆盖会把别人已完成的文件或正在下载的 .part 清掉，必须避让。
+                val finalName = if (canRename) {
+                    val dir = File(task.savePath).parentFile ?: File(".")
+                    avoidNameCollision(dir, serverName, task.savePath)
+                } else task.fileName
                 val savePath = if (finalName != task.fileName) {
                     File(File(task.savePath).parentFile ?: File("."), finalName).absolutePath
                 } else task.savePath
-                val t = task.copy(fileName = finalName, totalBytes = probe.totalBytes, savePath = savePath)
+                val t = task.copy(
+                    url = sourceUrl, fileName = finalName,
+                    totalBytes = probe.totalBytes, savePath = savePath
+                )
 
                 if (!hasResume) {
                     // 新任务：清掉同名残留半成品，避免旧数据混入新文件
@@ -224,12 +312,16 @@ class DownloadEngine private constructor() {
                 if (!cancelled.get()) {
                     failed.set(true)
                     working = DownloadTask.Status.FAILED
+                    shutdownPool(now = true)
+                    closeWriteRaf()
                     listener.onError(
                         task.copy(status = working), e.message ?: "未知错误"
                     )
                 }
             } finally {
                 ready.countDown()
+                // 探测失败/取消等没有启动分段线程的分支同样不能留下线程池
+                if (pool != null && (failed.get() || cancelled.get())) shutdownPool(now = true)
             }
         }
 
@@ -247,10 +339,12 @@ class DownloadEngine private constructor() {
          */
         fun externalWrite(t: DownloadTask, offset: Long, buf: ByteArray, len: Int): Boolean {
             if (len <= 0 || offset < 0) return false
-            // 先落盘（即使无分段计数，也保证数据就位供流服务器读取）
-            val f = File(t.savePath + ".part")
-            f.parentFile?.mkdirs()
-            RandomAccessFile(f, "rw").use { raf ->
+            // 合并已经开始/完成后不再接受回写：否则会在已不存在的 .part 上新建文件
+            if (finishing.get() || working == DownloadTask.Status.COMPLETED) return false
+            // v2.6.0：复用同一个 .part 句柄，避免播放器每次拉取都开/关文件；
+            // 合并前会显式关闭，保证 rename/delete 不受句柄占用影响。
+            synchronized(writeLock) {
+                val raf = writeRaf ?: openWriteRaf(t).also { writeRaf = it }
                 raf.seek(offset)
                 raf.write(buf, 0, len)
             }
@@ -280,7 +374,8 @@ class DownloadEngine private constructor() {
 
         fun cancel() {
             cancelled.set(true)
-            pool?.shutdownNow()
+            shutdownPool(now = true)
+            closeWriteRaf()
         }
 
         private fun segment(t: DownloadTask, start: Long, end: Long, counter: AtomicLong) {
@@ -300,13 +395,12 @@ class DownloadEngine private constructor() {
                     segDone(t)
                     return
                 }
-                conn = open(t.url, t.referer)
                 val wantRange = end >= 0 || resumeFrom > 0L
-                if (end >= 0) {
-                    conn.setRequestProperty("Range", "bytes=${start + resumeFrom}-$end")
-                } else if (resumeFrom > 0) {
-                    conn.setRequestProperty("Range", "bytes=$resumeFrom-")
-                }
+                // v2.6.0：Range 必须在连接建立前交给 HttpUtil —— 重定向的每一跳都要重放，
+                // 否则跟随跳转到最终地址后 Range 丢失，整文件被当成某个分段落盘。
+                val range = if (end >= 0) "bytes=${start + resumeFrom}-$end"
+                    else if (resumeFrom > 0L) "bytes=$resumeFrom-" else null
+                conn = open(t.url, t.referer, t.cookie, t.userAgent, range = range)
                 val code = conn.responseCode
                 if (code != 200 && code != 206) throw IOException("HTTP $code")
 
@@ -349,22 +443,31 @@ class DownloadEngine private constructor() {
                 // 而边下边播的 externalWrite 会推进共享 counter —— 若用 counter.get() 当偏移，
                 // 残留线程会把数据写到错误位置。私有位置保证各写者永不错位。
                 var myPos = resumeFrom
-                // v2.5.2：严格按分段长度收尾。少读一个字节即失败，多读的部分丢弃，
-                // 避免短响应被当成"该段完成"后合并出中间有洞的文件
-                var remaining = if (segLen > 0) segLen - resumeFrom else -1L
                 conn.inputStream.use { input ->
                     val buf = ByteArray(65536) // v1.0：64KB 缓冲
                     while (!cancelled.get()) {
-                        if (remaining == 0L) break
-                        val want = if (remaining > 0) minOf(buf.size.toLong(), remaining).toInt() else buf.size
+                        // v2.6.0：终点动态读取。本段可能被 Work Stealing 收缩过，
+                        // 收缩后只写到新终点，后半段由接管的空闲线程负责。
+                        val liveEnd = segEnds[start] ?: end
+                        val liveLen = if (liveEnd >= 0) liveEnd - start + 1 else -1L
+                        if (liveLen > 0 && myPos >= liveLen) break
+                        val want = if (liveLen > 0) minOf(buf.size.toLong(), liveLen - myPos).toInt() else buf.size
                         val read = input.read(buf, 0, want)
                         if (read < 0) break
                         writeAt(start, myPos, buf, read, file)
                         myPos += read
-                        // 计数只前进不后退（externalWrite 并发推进时取更大值，两者写的都是真实数据）
-                        counter.accumulateAndGet(read.toLong()) { cur, _ -> maxOf(cur, myPos) }
-                        atomicBytes.addAndGet(read.toLong())
-                        if (remaining > 0) remaining -= read
+                        // 计数在 stealLock 内按"当前"终点截断：切分方收缩终点后，
+                        // 慢段线程即使已多读一点也不会把后半段字节算进自己，验收才对得上。
+                        synchronized(stealLock) {
+                            val cap = segEnds[start] ?: end
+                            val limit = if (cap >= 0) cap - start + 1 else Long.MAX_VALUE
+                            val counted = minOf(myPos, limit)
+                            val delta = counted - counter.get()
+                            if (delta > 0) {
+                                counter.set(counted)
+                                atomicBytes.addAndGet(delta)
+                            }
+                        }
                         throttle(read) // 限速：在字节落盘并计数后阻塞，速度采样自然反映实际速率
                     }
                 }
@@ -373,9 +476,17 @@ class DownloadEngine private constructor() {
                 // 句柄未关时 rename/delete 会失败，合并后 .part 会残留
                 try { file.close() } catch (e: Exception) {}
                 raf = null
-                if (remaining > 0L) {
-                    throw IOException("分段数据不完整：还缺 $remaining 字节（已收 ${myPos - resumeFrom}）")
+                // v2.5.2：严格按（可能已收缩的）分段长度收尾。少读一个字节即失败，
+                // 多读的部分由接管线程覆盖，不会拼出中间有洞的文件。
+                val finalEnd = segEnds[start] ?: end
+                val finalLen = if (finalEnd >= 0) finalEnd - start + 1 else -1L
+                if (finalLen > 0 && myPos < finalLen) {
+                    throw IOException("分段数据不完整：还缺 ${finalLen - myPos} 字节（已收 ${myPos - resumeFrom}）")
                 }
+                // 本段先完成：交给空闲线程协助最慢的分段，再结算。
+                // 顺序必须是"先登记新段、后 segDone"，否则最后一段完成时
+                // done >= segCounters.size 会被提前满足而漏掉新段。
+                maybeSteal(t)
                 segDone(t)
             } catch (e: Exception) {
                 if (!cancelled.get()) {
@@ -384,13 +495,121 @@ class DownloadEngine private constructor() {
                     // 否则其余分段跑完会触发 onFinished，把失败任务翻成"已完成"并合并不完整文件
                     failed.set(true)
                     cancelled.set(true)
-                    pool?.shutdownNow()
+                    shutdownPool(now = true)
+                    closeWriteRaf()
                     working = DownloadTask.Status.FAILED
                     listener.onError(t.copy(status = working), e.message ?: "未知错误")
                 }
             } finally {
                 try { raf?.close() } catch (e: Exception) {}
                 conn?.disconnect()
+            }
+        }
+
+        /**
+         * v2.6.0：未知 Content-Length 的单线程流式下载。
+         * 没有总长度就没有分段边界，也不存在可靠的断点偏移，因此不登记 .swiftprog；
+         * 写完 EOF 后把实际字节数回填为 totalBytes，再复用同一套合并/验收收口。
+         */
+        private fun streamUnknownLength(t: DownloadTask, counter: AtomicLong) {
+            var conn: HttpURLConnection? = null
+            var raf: RandomAccessFile? = null
+            try {
+                conn = open(t.url, t.referer, t.cookie, t.userAgent)
+                val code = conn.responseCode
+                if (code !in 200..299) throw IOException("HTTP $code：服务器未返回可下载内容")
+                val f = File(t.savePath + ".part")
+                f.parentFile?.mkdirs()
+                val file = RandomAccessFile(f, "rw")
+                raf = file
+                file.setLength(0L)
+                var written = 0L
+                conn.inputStream.use { input ->
+                    val buf = ByteArray(65536)
+                    while (!cancelled.get()) {
+                        val n = input.read(buf)
+                        if (n < 0) break
+                        file.write(buf, 0, n)
+                        written += n
+                        counter.set(written)
+                        atomicBytes.addAndGet(n.toLong())
+                        throttle(n)
+                        listener.onProgress(t.copy(downloadedBytes = written), written, 0L)
+                    }
+                }
+                if (cancelled.get()) return
+                try { file.close() } catch (e: Exception) {}
+                raf = null
+                val finalTask = t.copy(totalBytes = written, downloadedBytes = written)
+                expectedTotal = written
+                if (!mergeParts(finalTask)) {
+                    throw IOException("合并文件失败（.part 无法改名或长度不符）")
+                }
+                working = DownloadTask.Status.COMPLETED
+                listener.onFinished(finalTask.copy(status = working, downloadedBytes = written))
+                shutdownPool(now = false)
+            } catch (e: Exception) {
+                if (!cancelled.get()) {
+                    Log.w(TAG, "streamUnknownLength", e)
+                    failed.set(true)
+                    cancelled.set(true)
+                    shutdownPool(now = true)
+                    closeWriteRaf()
+                    working = DownloadTask.Status.FAILED
+                    listener.onError(t.copy(status = working), e.message ?: "未知错误")
+                }
+            } finally {
+                try { raf?.close() } catch (e: Exception) {}
+                conn?.disconnect()
+            }
+        }
+
+        /**
+         * v2.6.0 Work Stealing：本段已完成，扫描其余分段，找到剩余量最大且超过阈值的慢段，
+         * 从它当前前沿一分为二，后半段交给本线程继续下载。
+         *
+         * 全程在 [stealLock] 内完成"收缩慢段终点 + 登记新计数器 + 派发新线程"，
+         * 保证慢段线程看到的终点与验收使用的终点一致。
+         */
+        private fun maybeSteal(t: DownloadTask) {
+            if (cancelled.get() || failed.get() || finishing.get()) return
+            val activePool = pool ?: return
+            synchronized(stealLock) {
+                var victimStart = -1L
+                var victimEnd = -1L
+                var victimCounter: AtomicLong? = null
+                var maxRemaining = 0L
+                for ((start, end) in segEnds) {
+                    if (end < 0) continue // 单线程直下/未知长度，无从切分
+                    val counter = segCounters[start] ?: continue
+                    val done = counter.get()
+                    val segLen = end - start + 1
+                    if (done >= segLen) continue // 已完成的分段不作为接管目标
+                    val remaining = segLen - done
+                    if (remaining > maxRemaining) {
+                        maxRemaining = remaining
+                        victimStart = start
+                        victimEnd = end
+                        victimCounter = counter
+                    }
+                }
+                if (victimStart < 0L || victimCounter == null) return
+                val plan = Segments.stealSplit(victimStart, victimEnd, victimCounter.get()) ?: return
+                val (shrunkEnd, newStart, newEnd) = plan
+                segEnds[victimStart] = shrunkEnd
+                val newCounter = AtomicLong(0L)
+                segCounters[newStart] = newCounter
+                segEnds[newStart] = newEnd
+                stealCount.incrementAndGet()
+                try {
+                    activePool.execute { segment(t, newStart, newEnd, newCounter) }
+                } catch (e: Exception) {
+                    // 线程池可能刚好被另一条完成路径关闭：撤销登记，慢段仍按原样下载
+                    segCounters.remove(newStart)
+                    segEnds.remove(newStart)
+                    segEnds[victimStart] = victimEnd
+                    stealCount.decrementAndGet()
+                }
             }
         }
 
@@ -409,12 +628,16 @@ class DownloadEngine private constructor() {
             if (problem != null) {
                 working = DownloadTask.Status.FAILED
                 failed.set(true)
+                shutdownPool(now = true)
+                closeWriteRaf()
                 listener.onError(t.copy(status = working), problem)
                 return
             }
             if (!mergeParts(t)) {
                 working = DownloadTask.Status.FAILED
                 failed.set(true)
+                shutdownPool(now = true)
+                closeWriteRaf()
                 listener.onError(t.copy(status = working), "合并文件失败（.part 无法改名或长度不符）")
                 return
             }
@@ -423,6 +646,9 @@ class DownloadEngine private constructor() {
                 status = working,
                 downloadedBytes = atomicBytes.get()
             ))
+            // v2.6.0：固定线程池的核心线程不会自行退出，成功后也必须显式 shutdown，
+            // 否则每个任务都会永久留 N 条线程。
+            shutdownPool(now = false)
         }
 
         /** 合并前的完整性验收：每段实际字节数 + 最终文件长度都必须与探测结果一致 */
@@ -444,6 +670,7 @@ class DownloadEngine private constructor() {
 
         /** .part → 正式文件：各线程按偏移写入同一 .part，直接就位（改名或复制） */
         private fun mergeParts(t: DownloadTask): Boolean {
+            closeWriteRaf() // 不能让任何句柄持有 .part，否则 rename/delete 会失败
             val part = File(t.savePath + ".part")
             val out = File(t.savePath)
             out.parentFile?.mkdirs()
@@ -498,16 +725,29 @@ class DownloadEngine private constructor() {
         throttle: (Int) -> Unit = {}
     ): DownloadJob = DownloadJob(task, listener, throttle)
 
-    /** Range 探测：HEAD 失败自动退化 GET+Range（v1.0 行为） */
-    fun probe(url: String, referer: String = ""): ProbeResult {
-        var conn = open(url, referer)
-        conn.requestMethod = "HEAD"
-        val headOk = try { conn.responseCode } catch (e: Exception) { -1 } == 200
-        if (!headOk) {
+    /**
+     * Range 探测：HEAD 失败自动退化 GET+Range（v1.0 行为）。
+     * v2.6.0：两条路径都必须拿到 2xx —— 403/404 的 HTML 错误页绝不能被当成文件长度。
+     */
+    fun probe(
+        url: String,
+        referer: String = "",
+        cookie: String = "",
+        userAgent: String = ""
+    ): ProbeResult {
+        var conn = open(url, referer, cookie, userAgent, method = "HEAD")
+        var code = try { conn.responseCode } catch (e: Exception) { -1 }
+        if (code !in 200..299) {
             conn.disconnect()
-            conn = open(url, referer)
-            conn.setRequestProperty("Range", "bytes=0-0")
+            conn = open(url, referer, cookie, userAgent, range = "bytes=0-0")
+            code = try { conn.responseCode } catch (e: Exception) { -1 }
+            if (code !in 200..299) {
+                val message = "HTTP $code：服务器未返回可下载内容"
+                conn.disconnect()
+                throw IOException(message)
+            }
         }
+        val finalUrl = conn.url.toString()
         val len = conn.getHeaderField("Content-Length")?.toLongOrNull() ?: -1L
         val cr = conn.getHeaderField("Content-Range")
         val ranges = conn.getHeaderField("Accept-Ranges")?.equals("bytes", true) == true ||
@@ -516,23 +756,24 @@ class DownloadEngine private constructor() {
             cr.substringAfter("/").toLongOrNull() ?: len
         } else len
         val name = Format.fileNameFromDisposition(conn.getHeaderField("Content-Disposition"))
-            ?: nameFromUrl(conn.url.toString())
+            ?: nameFromUrl(finalUrl)
         conn.disconnect()
-        return ProbeResult(total, ranges, name)
+        return ProbeResult(total, ranges, name, finalUrl)
     }
 
-    private fun open(url: String, referer: String = ""): HttpURLConnection {
-        val c = URL(url).openConnection() as HttpURLConnection
-        c.connectTimeout = 15000
-        c.readTimeout = 30000
-        c.instanceFollowRedirects = true
-        c.setRequestProperty(
-            "User-Agent",
-            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124 Mobile Safari/537.36"
-        )
-        // v2.5：防盗链站点（Referer 校验）必须带上来源页
-        if (referer.isNotBlank()) c.setRequestProperty("Referer", referer)
-        return c
+    /** 统一走 HttpUtil：手动重定向 + 统一 UA + Cookie 透传 */
+    private fun open(
+        url: String,
+        referer: String = "",
+        cookie: String = "",
+        userAgent: String = "",
+        range: String? = null,
+        method: String = "GET"
+    ): HttpURLConnection {
+        val extra = HashMap<String, String>()
+        if (cookie.isNotBlank()) extra["Cookie"] = cookie
+        if (userAgent.isNotBlank()) extra["User-Agent"] = userAgent
+        return HttpUtil.open(url, referer, range, method, extra)
     }
 
     companion object {
@@ -541,6 +782,32 @@ class DownloadEngine private constructor() {
         /** 探测/准备阶段的共享后台池（探测含网络，不能在主线程执行） */
         private val starterPool: ExecutorService = Executors.newCachedThreadPool { r ->
             Thread(r, "dl-probe").apply { isDaemon = true }
+        }
+
+        /**
+         * v2.6.0：Content-Disposition 改名时的磁盘冲突避让。
+         * 同名正式文件或同名 `.part`（别人正在下）都算占用，自动追加 " (2)"、" (3)"。
+         * 任务自己的原始路径不算冲突，否则同一任务重下永远拿不到原名。
+         */
+        fun avoidNameCollision(dir: File, desiredName: String, originalPath: String? = null): String {
+            val original = originalPath?.let { File(it).absolutePath }
+            fun occupied(name: String): Boolean {
+                val f = File(dir, name)
+                if (f.absolutePath == original) return false
+                if (f.exists()) return true
+                val part = File(dir, name + ".part")
+                return part.exists() && part.absolutePath != "$original.part"
+            }
+            if (!occupied(desiredName)) return desiredName
+            val dot = desiredName.lastIndexOf('.')
+            val stem = if (dot > 0) desiredName.substring(0, dot) else desiredName
+            val ext = if (dot > 0) desiredName.substring(dot) else ""
+            var i = 2
+            while (true) {
+                val candidate = "$stem ($i)$ext"
+                if (!occupied(candidate)) return candidate
+                i++
+            }
         }
 
         /** 去掉文件名中的路径分隔符与非法字符，避免写到意外位置 */

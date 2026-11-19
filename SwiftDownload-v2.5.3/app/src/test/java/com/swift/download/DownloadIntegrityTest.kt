@@ -26,7 +26,17 @@ import java.util.concurrent.atomic.AtomicReference
  */
 class DownloadIntegrityTest {
 
-    private enum class Mode { OK, IGNORE_RANGE, SHORT_BODY, WRONG_RANGE }
+    private enum class Mode {
+        OK, IGNORE_RANGE, SHORT_BODY, WRONG_RANGE,
+        /** v2.6.0：302 跳转到另一个端口 */
+        REDIRECT,
+        /** v2.6.0：403/404 的 HTML 错误页 */
+        ERROR_404,
+        /** v2.6.0：无 Content-Length 的 Chunked 流 */
+        NO_LENGTH,
+        /** v2.6.0：必须带指定 Cookie 才给数据 */
+        COOKIE
+    }
 
     private val payload = ByteArray(200_000) { ((it * 31) % 251).toByte() }
 
@@ -46,6 +56,8 @@ class DownloadIntegrityTest {
     /** 最小 HTTP/1.1 服务器：只为验证客户端的完整性校验行为 */
     private inner class StubServer(private val mode: Mode) {
         private val socket = ServerSocket(0, 20, InetAddress.getByName("127.0.0.1"))
+        /** REDIRECT 模式的目标地址（在目标服务器启动后才能确定） */
+        var redirectTo: String = ""
         val url: String get() = "http://127.0.0.1:${socket.localPort}/file.bin"
 
         fun start() {
@@ -67,14 +79,50 @@ class DownloadIntegrityTest {
                 val input = client.getInputStream()
                 val requestLine = readLine(input) ?: return
                 var range: String? = null
+                var cookie: String? = null
                 while (true) {
                     val line = readLine(input) ?: break
                     if (line.isEmpty()) break
                     if (line.lowercase().startsWith("range:")) {
                         range = line.substringAfter(':').trim()
                     }
+                    if (line.lowercase().startsWith("cookie:")) {
+                        cookie = line.substringAfter(':').trim()
+                    }
                 }
                 val out = client.getOutputStream()
+                when (mode) {
+                    Mode.REDIRECT -> {
+                        write(out, "HTTP/1.1 302 Found\r\nLocation: $redirectTo\r\nContent-Length: 0\r\n\r\n", null)
+                        return
+                    }
+                    Mode.ERROR_404 -> {
+                        val body = "<html><body>404 Not Found</body></html>".toByteArray()
+                        write(out, "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n" +
+                            "Content-Length: ${body.size}\r\n\r\n", body)
+                        return
+                    }
+                    Mode.NO_LENGTH -> {
+                        if (!requestLine.startsWith("GET")) {
+                            write(out, "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\n\r\n", null)
+                        } else {
+                            // 分块流：只给 Transfer-Encoding，不给 Content-Length
+                            out.write(("HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\n" +
+                                "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+                                .toByteArray(Charsets.ISO_8859_1))
+                            out.write((Integer.toHexString(payload.size) + "\r\n").toByteArray(Charsets.ISO_8859_1))
+                            out.write(payload)
+                            out.write("\r\n0\r\n\r\n".toByteArray(Charsets.ISO_8859_1))
+                            out.flush()
+                        }
+                        return
+                    }
+                    else -> {}
+                }
+                if (mode == Mode.COOKIE && cookie != "sid=abc") {
+                    write(out, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n", null)
+                    return
+                }
                 if (!requestLine.startsWith("GET")) {
                     // HEAD：只回头部，供引擎探测 Content-Length / Accept-Ranges
                     write(out, "HTTP/1.1 200 OK\r\n" +
@@ -214,6 +262,79 @@ class DownloadIntegrityTest {
             assertTrue("应报错", rec.failed.await(30, TimeUnit.SECONDS))
             assertFalse("不得判定完成", rec.finished.await(500, TimeUnit.MILLISECONDS))
             assertFalse("不得生成正式文件", File(t.savePath).exists())
+        }
+    }
+
+    @Test(timeout = 60_000)
+    fun `下载成功后线程池必须已关闭`() {
+        withServer(Mode.OK) { url ->
+            val rec = Recorder()
+            val job = DownloadEngine.get().newJob(task(9005, createTempDir()).copy(url = url), rec)
+            job.start()
+            assertTrue("应完成", rec.finished.await(30, TimeUnit.SECONDS))
+            assertTrue("成功结算后线程池必须 shutdown，否则核心线程永久泄漏", job.isPoolShutdown())
+        }
+    }
+
+    @Test(timeout = 60_000)
+    fun `跨端口302重定向后分段请求仍完整`() {
+        withServer(Mode.OK) { targetUrl ->
+            val redirect = StubServer(Mode.REDIRECT).apply { redirectTo = targetUrl }
+            redirect.start()
+            try {
+                val t = task(9006, createTempDir()).copy(url = redirect.url)
+                val rec = Recorder()
+                DownloadEngine.get().newJob(t, rec).start()
+                assertTrue("重定向后应完成", rec.finished.await(30, TimeUnit.SECONDS))
+                assertArrayEquals(payload, File(t.savePath).readBytes())
+            } finally {
+                redirect.stop()
+            }
+        }
+    }
+
+    @Test(timeout = 60_000)
+    fun `服务器返回404错误页必须失败且不生成文件`() {
+        withServer(Mode.ERROR_404) { url ->
+            val t = task(9007, createTempDir()).copy(url = url)
+            val rec = Recorder()
+            DownloadEngine.get().newJob(t, rec).start()
+            assertTrue("应报错", rec.failed.await(30, TimeUnit.SECONDS))
+            assertFalse("不得判定完成", rec.finished.await(500, TimeUnit.MILLISECONDS))
+            assertFalse("HTML 错误页不得生成正式文件", File(t.savePath).exists())
+            assertTrue(rec.error.get()?.contains("404") == true)
+        }
+    }
+
+    @Test(timeout = 60_000)
+    fun `无ContentLength的Chunked流单线程下载完成且内容一致`() {
+        withServer(Mode.NO_LENGTH) { url ->
+            val t = task(9008, createTempDir()).copy(url = url, threads = 4)
+            val rec = Recorder()
+            DownloadEngine.get().newJob(t, rec).start()
+            assertTrue("无长度也应完成", rec.finished.await(30, TimeUnit.SECONDS))
+            val out = File(t.savePath)
+            assertTrue("应产出正式文件", out.isFile)
+            assertEquals(payload.size.toLong(), out.length())
+            assertArrayEquals(payload, out.readBytes())
+        }
+    }
+
+    @Test(timeout = 60_000)
+    fun `Cookie透传成功而缺失Cookie必须失败`() {
+        withServer(Mode.COOKIE) { url ->
+            val dir = createTempDir()
+            val denied = task(9009, dir).copy(url = url)
+            val deniedRec = Recorder()
+            DownloadEngine.get().newJob(denied, deniedRec).start()
+            assertTrue("缺 Cookie 应失败", deniedRec.failed.await(30, TimeUnit.SECONDS))
+            assertFalse(File(denied.savePath).exists())
+
+            val okTask = task(9010, createTempDir()).copy(url = url, cookie = "sid=abc")
+            val okRec = Recorder()
+            DownloadEngine.get().newJob(okTask, okRec).start()
+            assertTrue("带 Cookie 应完成", okRec.finished.await(30, TimeUnit.SECONDS))
+            assertArrayEquals(payload, File(okTask.savePath).readBytes())
         }
     }
 }

@@ -20,7 +20,12 @@ data class DownloadTask(
     val hash: String = "",
     // ---- v2.5 新增：m3u8 任务的清晰度选择与来源页（跨进程重启保留）----
     val variant: String = "",
-    val referer: String = ""
+    val referer: String = "",
+    // ---- v2.6.0 新增：登录态与 UA 透传（v4 迁移）----
+    val cookie: String = "",
+    val userAgent: String = "",
+    /** MediaStore 导出后的 content:// URI（v4 迁移，供打开/重播兜底） */
+    val exportUri: String = ""
 ) {
     enum class Status private constructor(val value: Int, val label: String) {
         QUEUED(0, "等待"),

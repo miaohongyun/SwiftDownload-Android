@@ -83,8 +83,8 @@ object Dlna {
     }
 
     /** 把播放地址推给渲染器并播放 */
-    fun cast(dev: Device, url: String): Boolean = try {
-        soap(dev.controlUrl, "SetAVTransportURI", buildSetUriSoap(url)) &&
+    fun cast(dev: Device, url: String, title: String = ""): Boolean = try {
+        soap(dev.controlUrl, "SetAVTransportURI", buildSetUriSoap(url, title)) &&
             soap(dev.controlUrl, "Play", PLAY_SOAP)
     } catch (e: Exception) {
         false
@@ -115,7 +115,13 @@ object Dlna {
         Regex("<friendlyName>\\s*(.*?)\\s*</friendlyName>", RegexOption.DOT_MATCHES_ALL)
             .find(xml)?.groupValues?.get(1)?.takeIf { it.isNotBlank() }
 
-    fun buildSetUriSoap(url: String): String = buildString {
+    /**
+     * v2.6.0：填充标准极简 DIDL-Lite 元数据。部分电视/盒子在 CurrentURIMetaData 为空时
+     * 会拒绝 SetAVTransportURI；带上标题与 res protocolInfo 后兼容性显著提升。
+     *
+     * DIDL 作为 SOAP 元素文本内容，整体需 XML 转义一次（电视端会把它当字符串再解析）。
+     */
+    fun buildSetUriSoap(url: String, title: String = ""): String = buildString {
         append("""<?xml version="1.0" encoding="utf-8"?>""")
         append("<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" ")
         append("s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">")
@@ -123,8 +129,29 @@ object Dlna {
         append("<u:SetAVTransportURI xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">")
         append("<InstanceID>0</InstanceID>")
         append("<CurrentURI>").append(escapeXml(url)).append("</CurrentURI>")
-        append("<CurrentURIMetaData></CurrentURIMetaData>")
+        append("<CurrentURIMetaData>").append(escapeXml(didlLite(url, title))).append("</CurrentURIMetaData>")
         append("</u:SetAVTransportURI></s:Body></s:Envelope>")
+    }
+
+    /** 极简 DIDL-Lite：item + dc:title + upnp:class + res(protocolInfo) */
+    fun didlLite(url: String, title: String = ""): String {
+        val mime = when {
+            url.substringBefore('?').endsWith(".m3u8", true) -> "video/mp4"
+            url.substringBefore('?').endsWith(".mkv", true) -> "video/x-matroska"
+            else -> "video/mp4"
+        }
+        val safeTitle = escapeXml(title.ifBlank { "视频" })
+        return buildString {
+            append("<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" ")
+            append("xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" ")
+            append("xmlns:dc=\"http://purl.org/dc/elements/1.1/\">")
+            append("<item id=\"0\" parentID=\"-1\" restricted=\"1\">")
+            append("<dc:title>").append(safeTitle).append("</dc:title>")
+            append("<upnp:class>object.item.videoItem</upnp:class>")
+            append("<res protocolInfo=\"http-get:*:").append(mime).append(":*\">")
+            append(escapeXml(url)).append("</res>")
+            append("</item></DIDL-Lite>")
+        }
     }
 
     private val PLAY_SOAP = buildString {
@@ -254,7 +281,10 @@ class DlnaPicker(
             .setTitle("投屏 · $title")
             .setView(container)
             .setNegativeButton("取消", null)
-            .show()
+            .create()
+        // v2.6.0：点外部/返回键关闭时也要停掉扫描，避免对话框消失后线程仍在跑
+        dialog?.setOnDismissListener { stopped.set(true) }
+        dialog?.show()
         listHost = container
         statusView = status
         Thread {
@@ -322,7 +352,7 @@ class DlnaPicker(
                 main.post { Ui.toast(ctx, "无法建立本地播放地址（检查文件是否存在）") }
                 return@Thread
             }
-            val ok = Dlna.cast(dev, url)
+            val ok = Dlna.cast(dev, url, title)
             main.post {
                 if (ok) {
                     casted = dev

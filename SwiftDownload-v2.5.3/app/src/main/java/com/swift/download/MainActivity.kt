@@ -105,15 +105,15 @@ class MainActivity : AppCompatActivity() {
 
         browserPage = BrowserPage(
             this,
-            onNewDownload = { url, name, referer -> addHttp(url, name, referer) },
+            onNewDownload = { url, name, referer, cookie -> addHttp(url, name, referer, cookie) },
             onNewMagnet = { uri -> addMagnet(uri) },
             onOpenMagnetSearch = { kw -> openMagnetSearch(kw) },
-            onVideoDetected = { url, name, referer ->
+            onVideoDetected = { url, name, referer, cookie ->
                 // v2.5：嗅探到的 mp4 直链也带 Referer（防盗链站点否则 403）
                 if (com.swift.download.player.VideoSniff.isMp4(url)) {
-                    binder?.addHttpTaskWithReferer(url, name, 4, referer)
+                    binder?.addHttpTaskWithReferer(url, name, 4, referer, cookie)
                 } else {
-                    binder?.addVideoTask(url, name, url, referer)
+                    binder?.addVideoTask(url, name, url, referer, cookie)
                 }
                 switchTo(1)
                 Ui.toast(this, "视频任务已添加")
@@ -191,7 +191,7 @@ class MainActivity : AppCompatActivity() {
                 conn.connectTimeout = 15000
                 conn.setRequestProperty(
                     "User-Agent",
-                    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124 Mobile Safari/537.36"
+                    HttpUtil.USER_AGENT
                 )
                 val bytes = conn.inputStream.use { it.readBytes() }
                 conn.disconnect()
@@ -221,9 +221,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun addHttp(url: String, name: String, referer: String = "") {
-        if (referer.isNotBlank()) {
-            binder?.addHttpTaskWithReferer(url, name, 4, referer)
+    private fun addHttp(
+        url: String, name: String, referer: String = "",
+        cookie: String = "", userAgent: String = ""
+    ) {
+        if (referer.isNotBlank() || cookie.isNotBlank() || userAgent.isNotBlank()) {
+            binder?.addHttpTaskWithReferer(url, name, 4, referer, cookie, userAgent)
         } else {
             binder?.addHttpTask(url, name, 4)
         }
@@ -393,10 +396,11 @@ class MainActivity : AppCompatActivity() {
                         browserPage.newTab(url)
                     },
                     onChanged = { browserPage.refreshBookmarks() }
-                ))
+                ), "书签管理")
             },
-            "磁力源管理" to { showOverlay(MagnetSourceManagerPage(ctx)) },
+            "磁力源管理" to { showOverlay(MagnetSourceManagerPage(ctx), "磁力源管理") },
             "下载设置" to { showSettingsFromMine() },
+            "局域网传链接" to { toggleLanRemote() },
             "关于" to { showAbout() }
         )
         for ((name, act) in entries) {
@@ -414,12 +418,47 @@ class MainActivity : AppCompatActivity() {
         return Ui.verticalScroll(ctx, root)
     }
 
+    /** v2.6.0：一键开关局域网投递面板，显示或关闭访问地址 */
+    private fun toggleLanRemote() {
+        val b = binder
+        if (b == null) {
+            Ui.toast(this, "下载服务未就绪，请稍后再试")
+            return
+        }
+        if (b.isLanRemoteRunning()) {
+            b.stopLanRemote()
+            Ui.toast(this, "局域网投递已关闭")
+            return
+        }
+        val url = b.startLanRemote()
+        if (url == null) {
+            android.app.AlertDialog.Builder(this)
+                .setTitle("无法开启局域网投递")
+                .setMessage("未检测到 Wi-Fi 局域网地址，请连接 Wi-Fi 后重试。\n\n出于安全考虑，此面板只在可信网络下临时开启，用完请及时关闭。")
+                .setPositiveButton("知道了", null)
+                .show()
+        } else {
+            android.app.AlertDialog.Builder(this)
+                .setTitle("局域网投递已开启")
+                .setMessage("在电脑浏览器打开：\n\n$url\n\n可粘贴直链/磁力、上传 .torrent，并查看任务列表。\n用完请回到此页面点「局域网传链接」关闭。")
+                .setPositiveButton("复制地址") { _, _ ->
+                    try {
+                        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                        cm.setPrimaryClip(android.content.ClipData.newPlainText("lan", url))
+                        Ui.toast(this, "地址已复制")
+                    } catch (e: Exception) { Ui.toast(this, url) }
+                }
+                .setNegativeButton("关闭面板", null)
+                .show()
+        }
+    }
+
     private fun showSettingsFromMine() {
         showOverlay(DownloadSettingsPage(
             this,
             binder?.getSettings() ?: DownloadSettings.get(this),
             onClose = { closeOverlay() }
-        ))
+        ), "下载设置")
     }
 
     private fun showAbout() {
@@ -438,15 +477,40 @@ class MainActivity : AppCompatActivity() {
             closeOverlay()
         }
         magnetSearchPage = page
-        showOverlay(page)
+        showOverlay(page, "磁力搜索")
         if (keyword.isNotEmpty()) page.prefillKeyword(keyword)
     }
 
-    private fun showOverlay(page: View) {
+    /** v2.6.0：浮层统一加「← 返回 + 标题」导航栏，不再只能靠系统手势/返回键退出 */
+    private fun showOverlay(page: View, title: String = "详情") {
         val root = findViewById<ViewGroup>(android.R.id.content)
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            setBackgroundColor(Ui.BG)
+            setPadding(Ui.dp(this@MainActivity, 12f), Ui.dp(this@MainActivity, 10f),
+                Ui.dp(this@MainActivity, 12f), Ui.dp(this@MainActivity, 10f))
+        }
+        val back = TextView(this).apply {
+            text = "← 返回"
+            textSize = 15f
+            setTextColor(Ui.BLUE)
+            setPadding(Ui.dp(this@MainActivity, 4f), Ui.dp(this@MainActivity, 4f),
+                Ui.dp(this@MainActivity, 12f), Ui.dp(this@MainActivity, 4f))
+            setOnClickListener { closeOverlay() }
+        }
+        header.addView(back)
+        header.addView(Ui.text(this, title, 16f, Ui.TXT, bold = true),
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val column = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(header, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            addView(page, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        }
         val fl = FrameLayout(this).apply {
-            setBackgroundColor(0xF2151520.toInt())
-            addView(page, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            setBackgroundColor(Ui.BG)
+            addView(column, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         }
         root.addView(fl, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         overlay = fl
@@ -475,6 +539,25 @@ class MainActivity : AppCompatActivity() {
 
     private var lastBackAt = 0L
 
+    /* ---------------- v2.6.0：窗口获焦检测剪贴板 + WebView 生命周期 ---------------- */
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            try { transfersPage.checkClipboard() } catch (e: Exception) { /* 剪贴板权限/空内容 */ }
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        try { browserPage.onHostPause() } catch (e: Exception) {}
+    }
+
+    override fun onResume() {
+        super.onResume()
+        try { browserPage.onHostResume() } catch (e: Exception) {}
+    }
+
     /* ---------------- 服务连接 ---------------- */
     private fun bindDownloadService() {
         DownloadService.start(this)
@@ -502,13 +585,18 @@ class MainActivity : AppCompatActivity() {
         }
         binder?.setUiListener(null)
         binder = null
+        try { browserPage.onHostDestroy() } catch (e: Exception) {}
         scope.cancel()
     }
 
     private val transferController = object : TransfersPage.Controller {
-        override fun addHttpTask(url: String, fileName: String, threads: Int) {
-            binder?.addHttpTask(url, fileName, threads)
+        override fun addHttpTask(
+            url: String, fileName: String, threads: Int,
+            referer: String, cookie: String, userAgent: String
+        ) {
+            binder?.addHttpTaskWithReferer(url, fileName, threads, referer, cookie, userAgent)
         }
+        override fun addMagnetLink(uri: String) { addMagnet(uri) }
         override fun pause(id: Long) { binder?.pause(id) }
         override fun resume(id: Long) { binder?.resume(id) }
         override fun delete(id: Long, withFiles: Boolean) { binder?.delete(id, withFiles) }
@@ -533,6 +621,19 @@ class MainActivity : AppCompatActivity() {
         override fun setTaskLimit(id: Long, bps: Long) {
             binder?.setTaskLimitBps(id, bps)
         }
+        override fun taskLimits(): Map<Long, Long> {
+            val s = binder?.getSettings() ?: return emptyMap()
+            return lastTasks.associate { it.id to s.taskLimitBps(it.id) }.filterValues { it > 0L }
+        }
+        override fun btFiles(id: Long): List<com.swift.download.bt.BtFile> =
+            binder?.btFiles(id) ?: emptyList()
+        override fun setBtFileSelection(id: Long, selected: IntArray): Boolean =
+            binder?.setBtFileSelection(id, selected) == true
+        override fun setBtSequential(id: Long, enabled: Boolean): Boolean =
+            binder?.setBtSequential(id, enabled) == true
+        override fun isBtSequential(id: Long): Boolean =
+            binder?.isBtSequential(id) == true
+        override fun btReadyVideoPath(id: Long): String? = binder?.btReadyVideoPath(id)
     }
 
     /* ---------------- 杂项 ---------------- */

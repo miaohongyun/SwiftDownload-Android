@@ -2,7 +2,9 @@ package com.swift.download.bt
 
 import android.util.Log
 import com.frostwire.jlibtorrent.AddTorrentParams
+import com.frostwire.jlibtorrent.Priority
 import com.frostwire.jlibtorrent.Sha1Hash
+import com.frostwire.jlibtorrent.TorrentFlags
 import com.frostwire.jlibtorrent.SessionManager
 import com.frostwire.jlibtorrent.SessionParams
 import com.frostwire.jlibtorrent.SettingsPack
@@ -32,6 +34,8 @@ class TorrentEngine private constructor() {
     private val io: ExecutorService = Executors.newSingleThreadExecutor()
     @Volatile private var started = false
     private val listeners = ArrayList<BtListener>()
+    /** v2.6.0：shutdown() 后 session 仍持有 listener，重启时不能重复 add */
+    private val listenerGuard = ListenerOnceGuard()
 
     fun addListener(l: BtListener) { synchronized(listeners) { listeners.add(l) } }
 
@@ -52,7 +56,7 @@ class TorrentEngine private constructor() {
             sp.listenInterfaces("0.0.0.0:0")
             session.start(SessionParams(sp))
             session.startDht()
-            session.addListener(alertListener)
+            listenerGuard.registerOnce { session.addListener(alertListener) }
             started = true
         }
     }
@@ -158,6 +162,18 @@ class TorrentEngine private constructor() {
         )
     }
 
+    /** v2.6.0：排队中的种子先暂停，避免"仅 Wi-Fi / 时段"规则期间偷跑 */
+    fun pause(hash: String): Boolean {
+        val h = find(hash) ?: return false
+        return try {
+            h.pause()
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "pause", e)
+            false
+        }
+    }
+
     fun remove(hash: String) {
         try {
             find(hash)?.let { session.remove(it) }
@@ -180,6 +196,87 @@ class TorrentEngine private constructor() {
             Log.w(TAG, "resume", e)
             false
         }
+    }
+
+    /* ---------------- v2.6.0：选文件 / 顺序下载 ---------------- */
+
+    /** 种子内文件列表（含当前是否勾选）；元数据未到达时返回空列表 */
+    fun fileList(hash: String): List<BtFile> {
+        val h = find(hash) ?: return emptyList()
+        if (!h.status().hasMetadata()) return emptyList()
+        val files = try { h.torrentFile()?.files() } catch (e: Exception) { null } ?: return emptyList()
+        val priorities = try { h.filePriorities() } catch (e: Exception) { null }
+        return (0 until files.numFiles()).map { i ->
+            BtFile(
+                index = i,
+                name = try { files.fileName(i) } catch (e: Exception) { "文件 $i" },
+                path = try { files.filePath(i) } catch (e: Exception) { "" },
+                size = try { files.fileSize(i) } catch (e: Exception) { 0L },
+                wanted = priorities?.getOrNull(i) != Priority.IGNORE
+            )
+        }
+    }
+
+    /**
+     * 设置文件勾选：未选中的设为 IGNORE，选中的设为 NORMAL。
+     * 传入空集合表示"全不选"，调用方应阻止这种非法状态（至少一个文件）。
+     */
+    fun setFilePriorities(hash: String, selected: Set<Int>): Boolean {
+        val h = find(hash) ?: return false
+        if (selected.isEmpty()) return false
+        val count = try { h.torrentFile()?.numFiles() ?: 0 } catch (e: Exception) { 0 }
+        if (count <= 0) return false
+        val normalized = BtFileSelection.normalize(selected, count)
+        if (normalized.isEmpty()) return false
+        return try {
+            h.prioritizeFiles(BtFileSelection.priorities(count, normalized))
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "setFilePriorities", e)
+            false
+        }
+    }
+
+    /** 顺序下载：让前置连续块优先完成，单视频种子可提前播放 */
+    fun setSequential(hash: String, enabled: Boolean): Boolean {
+        val h = find(hash) ?: return false
+        return try {
+            if (enabled) h.setFlags(TorrentFlags.SEQUENTIAL_DOWNLOAD)
+            else h.unsetFlags(TorrentFlags.SEQUENTIAL_DOWNLOAD)
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "setSequential", e)
+            false
+        }
+    }
+
+    fun isSequential(hash: String): Boolean = try {
+        find(hash)?.flags()?.and_(TorrentFlags.SEQUENTIAL_DOWNLOAD)
+            ?.eq(TorrentFlags.SEQUENTIAL_DOWNLOAD) == true
+    } catch (e: Exception) {
+        Log.w(TAG, "isSequential", e)
+        false
+    }
+
+    /**
+     * 已完整落盘且已勾选视频的本地路径（顺序下载"就绪即播"用）。
+     * jlibtorrent 的 fileProgress() 返回每个文件已完成字节数组。
+     */
+    fun readyVideoPath(hash: String): String? {
+        val h = find(hash) ?: return null
+        val files = fileList(hash).filter { it.wanted && BtFileSelection.isVideoName(it.name) }
+        if (files.isEmpty()) return null
+        val progress = try { h.fileProgress() } catch (e: Exception) { return null }
+        val base = try { h.savePath() } catch (e: Exception) { return null }
+        for (f in files) {
+            val done = progress.getOrNull(f.index) ?: continue
+            if (BtFileSelection.isReady(done, f.size)) {
+                val rel = f.path.ifBlank { f.name }
+                return listOf("$base/$rel", "$base/${f.name}")
+                    .map(::File).firstOrNull { it.isFile }?.absolutePath
+            }
+        }
+        return null
     }
 
     data class BtProgress(

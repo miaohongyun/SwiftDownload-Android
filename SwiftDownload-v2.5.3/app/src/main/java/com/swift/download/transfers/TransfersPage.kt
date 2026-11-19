@@ -37,7 +37,12 @@ class TransfersPage(
 ) : android.widget.FrameLayout(context) {
 
     interface Controller {
-        fun addHttpTask(url: String, fileName: String, threads: Int)
+        fun addHttpTask(
+            url: String, fileName: String, threads: Int,
+            referer: String = "", cookie: String = "", userAgent: String = ""
+        )
+        /** v2.6.0：剪贴板识别到的磁力链接 */
+        fun addMagnetLink(uri: String) {}
         fun pause(id: Long)
         fun resume(id: Long)
         fun delete(id: Long, withFiles: Boolean)
@@ -54,6 +59,14 @@ class TransfersPage(
         fun refreshLink(id: Long, newUrl: String): Boolean
         /** 单任务限速，字节/秒；0 = 跟随全局 */
         fun setTaskLimit(id: Long, bps: Long)
+        /** v2.6.0：从持久化设置回读所有任务限速值（重启后仍能回显） */
+        fun taskLimits(): Map<Long, Long> = emptyMap()
+        /* v2.6.0：BT 选文件 / 顺序下载 / 就绪即播 */
+        fun btFiles(id: Long): List<com.swift.download.bt.BtFile> = emptyList()
+        fun setBtFileSelection(id: Long, selected: IntArray): Boolean = false
+        fun setBtSequential(id: Long, enabled: Boolean): Boolean = false
+        fun isBtSequential(id: Long): Boolean = false
+        fun btReadyVideoPath(id: Long): String? = null
     }
 
     private var threadsPref = 4
@@ -165,14 +178,15 @@ class TransfersPage(
 
     private var ignoredClipboardUrl: String? = null
 
-    private fun checkClipboard() {
+    /** v2.6.0：从整段分享文案中提取直链/磁力（获焦时由宿主调用） */
+    fun checkClipboard() {
         try {
             val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             val text = cm.primaryClip?.getItemAt(0)?.text?.toString()?.trim() ?: return
-            if ((text.startsWith("http://") || text.startsWith("https://")) && text != ignoredClipboardUrl) {
-                adapter.pendingClipUrl = text
-                onTasks(lastTasks)
-            }
+            val links = com.swift.download.player.VideoSniff.extractLinks(text)
+            val hit = links.firstOrNull { it != ignoredClipboardUrl } ?: return
+            adapter.pendingClipUrl = hit
+            onTasks(lastTasks)
         } catch (e: Exception) {
             // 忽略
         }
@@ -186,12 +200,34 @@ class TransfersPage(
     private fun showNewTaskDialog(prefill: String = "") {
         val ctx = context
         val et = Ui.singleLineEt(ctx, "粘贴 http/https 下载直链").apply { setText(prefill) }
+        // v2.6.0：高级选项可折叠，平时不干扰"粘贴即下"的主流程
+        val advanced = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL; visibility = View.GONE }
+        val etName = Ui.singleLineEt(ctx, "自定义文件名（留空自动识别）")
+        val etReferer = Ui.singleLineEt(ctx, "Referer（防盗链来源页）")
+        val etCookie = Ui.singleLineEt(ctx, "Cookie（登录态）")
+        val etUa = Ui.singleLineEt(ctx, "User-Agent（留空用内置 UA）")
+        for (field in listOf(etName, etReferer, etCookie, etUa)) {
+            advanced.addView(field, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = Ui.dp(ctx, 6f) })
+        }
+        val toggle = Ui.text(ctx, "高级选项 ▾", 13f, Ui.BLUE).apply {
+            setOnClickListener {
+                val open = advanced.visibility == View.GONE
+                advanced.visibility = if (open) View.VISIBLE else View.GONE
+                text = if (open) "高级选项 ▴" else "高级选项 ▾"
+            }
+        }
         val wrap = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(Ui.dp(ctx, 20f), Ui.dp(ctx, 8f), Ui.dp(ctx, 20f), 0)
             addView(et, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
             addView(Ui.text(ctx, "支持多线程加速与断点续传，文件名自动识别。", 12f, Ui.TXT_SUB),
                 LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = Ui.dp(ctx, 8f) })
+            addView(toggle, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = Ui.dp(ctx, 8f) })
+            addView(advanced, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = Ui.dp(ctx, 4f) })
         }
         AlertDialog.Builder(ctx)
             .setTitle("新建下载任务")
@@ -199,8 +235,14 @@ class TransfersPage(
             .setPositiveButton("开始下载") { _, _ ->
                 val url = et.text.toString().trim()
                 if (url.startsWith("http://") || url.startsWith("https://")) {
-                    controller.addHttpTask(url, "", threadsPref)
-                    Ui.toast(ctx, "任务已添加：${com.swift.download.nameFromUrl(url)}")
+                    val name = etName.text.toString().trim()
+                    controller.addHttpTask(
+                        url, name, threadsPref,
+                        etReferer.text.toString().trim(),
+                        etCookie.text.toString().trim(),
+                        etUa.text.toString().trim()
+                    )
+                    Ui.toast(ctx, "任务已添加：${name.ifBlank { com.swift.download.nameFromUrl(url) }}")
                     adapter.pendingClipUrl = null
                 } else {
                     Ui.toast(ctx, "请输入 http/https 开头的直链")
@@ -346,9 +388,15 @@ class TransfersPage(
             val ignore = action(ctx, "忽略", Ui.TXT_SUB) {
                 ignoredClipboardUrl = url; adapter.pendingClipUrl = null; onTasks(lastTasksRef)
             }
+            val isMagnet = com.swift.download.player.VideoSniff.isMagnet(url)
+            card.addView(Ui.text(ctx, if (isMagnet) "磁力链接" else "下载直链", 11f, Ui.TXT_SUB),
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                    .apply { topMargin = Ui.dp(ctx, 2f) })
             val download = action(ctx, "立即下载", Ui.BLUE, primary = true) {
-                controller.addHttpTask(url, "", threadsPref)
+                if (isMagnet) controller.addMagnetLink(url)
+                else controller.addHttpTask(url, "", threadsPref)
                 adapter.pendingClipUrl = null
+                ignoredClipboardUrl = url
                 onTasks(lastTasksRef)
             }
             actions.addFlow(ignore)
@@ -502,6 +550,11 @@ class TransfersPage(
                     if (MediaTypes.isVideoName(t.fileName) && java.io.File(t.savePath).isFile) {
                         actions.addFlow(action(ctx, "投屏", Ui.GREEN) { controller.castTask(t.savePath) })
                     }
+                    if (java.io.File(t.savePath).isFile) {
+                        actions.addFlow(action(ctx, "校验哈希", Ui.TXT_SUB) {
+                            com.swift.download.HashDialog.show(ctx, java.io.File(t.savePath))
+                        })
+                    }
                     actions.addFlow(action(ctx, "重新下载", Ui.TXT_SUB) { confirmRestart(t) })
                 }
                 DownloadTask.Status.FAILED -> {
@@ -516,10 +569,54 @@ class TransfersPage(
                 val label = if (limit > 0) "限速 ${limit / 1024 / 1024}M" else "限速"
                 actions.addFlow(action(ctx, label, Ui.TXT_SUB) { showTaskLimitDialog(t) })
             }
+            // v2.6.0：BT 选文件 / 顺序下载 / 就绪即播（运行中或暂停时可调）
+            if (t.isBt && st != DownloadTask.Status.COMPLETED && st != DownloadTask.Status.FAILED) {
+                actions.addFlow(action(ctx, "选择文件", Ui.TXT_SUB) { showBtFileDialog(t) })
+                val sequential = controller.isBtSequential(t.id)
+                actions.addFlow(action(ctx, if (sequential) "顺序✓" else "顺序下载", Ui.TXT_SUB) {
+                    if (controller.setBtSequential(t.id, !sequential)) {
+                        Ui.toast(ctx, if (sequential) "已关闭顺序下载" else "已开启顺序下载")
+                    } else Ui.toast(ctx, "种子尚未就绪，请稍后再试")
+                })
+                val ready = controller.btReadyVideoPath(t.id)
+                if (ready != null) {
+                    actions.addFlow(action(ctx, "预览", Ui.GREEN) { controller.openFile(ready) })
+                }
+            }
             actions.addFlow(action(ctx, "删除", Ui.RED) { confirmDelete(t) })
             card.addView(actions, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { topMargin = Ui.dp(ctx, 8f) })
+        }
+
+        /** v2.6.0：种子内文件勾选弹窗，未勾选的文件设为 IGNORE 不再下载 */
+        private fun showBtFileDialog(t: com.swift.download.DownloadTask) {
+            val ctx = card.context
+            val files = controller.btFiles(t.id)
+            if (files.isEmpty()) {
+                Ui.toast(ctx, "种子元数据尚未到达，请稍后再试")
+                return
+            }
+            val checked = BooleanArray(files.size) { files[it].wanted }
+            val names = Array(files.size) { i ->
+                "${files[i].name}  ${Format.bytes(files[i].size)}"
+            }
+            AlertDialog.Builder(ctx)
+                .setTitle("选择文件 · ${t.fileName}")
+                .setMultiChoiceItems(names, checked) { _, which, isChecked ->
+                    checked[which] = isChecked
+                }
+                .setPositiveButton("应用") { _, _ ->
+                    val selected = IntArray(files.size) { i -> if (checked[i]) files[i].index else -1 }
+                        .filter { it >= 0 }.toIntArray()
+                    if (selected.isEmpty()) {
+                        Ui.toast(ctx, "请至少选择一个文件")
+                    } else if (controller.setBtFileSelection(t.id, selected)) {
+                        Ui.toast(ctx, "已选择 ${selected.size} 个文件")
+                    } else Ui.toast(ctx, "设置失败，请稍后重试")
+                }
+                .setNegativeButton("取消", null)
+                .show()
         }
 
         private fun statusColor(st: DownloadTask.Status): Int = when (st) {
@@ -570,7 +667,10 @@ class TransfersPage(
             // 原实现固定显示 "0"，用户看不到自己设过多少，重复设置时容易误操作。
             val current = taskLimits[t.id] ?: 0L
             val currentText = if (current > 0) (current / 1024 / 1024).toString() else "0"
-            val et = Ui.singleLineEt(ctx, "0 = 跟随全局设置").apply { setText(currentText) }
+            val et = Ui.singleLineEt(ctx, "0 = 跟随全局设置").apply {
+                inputType = android.text.InputType.TYPE_CLASS_NUMBER
+                setText(currentText)
+            }
             val wrap = LinearLayout(ctx).apply {
                 orientation = LinearLayout.VERTICAL
                 setPadding(Ui.dp(ctx, 20f), Ui.dp(ctx, 8f), Ui.dp(ctx, 20f), 0)
@@ -611,6 +711,14 @@ class TransfersPage(
     /* 宿主每轮通知时更新页面 */
     fun accept(tasks: List<DownloadTask>, speeds: Map<Long, Long>) {
         lastTasks = tasks
+        // v2.6.0：限速标记与弹窗回显以服务端持久化值为准，不再只依赖本次会话的本地缓存
+        val limits = controller.taskLimits()
+        val liveIds = tasks.map { it.id }.toHashSet()
+        taskLimits.keys.removeAll { it !in liveIds }
+        for (id in liveIds) {
+            val bps = limits[id] ?: 0L
+            if (bps > 0L) taskLimits[id] = bps else taskLimits.remove(id)
+        }
         if (speeds.isNotEmpty()) {
             for ((id, s) in speeds) serverSpeeds[id] = s
         }

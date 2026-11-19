@@ -36,8 +36,11 @@ object DownloadRules {
 
     const val WAIT_WIFI = "等待 Wi-Fi 连接"
     const val WAIT_SCHEDULE = "等待允许下载时段"
+    /** v2.6.0：并发队列已满 */
+    const val WAIT_QUEUE = "等待空闲队列"
 
-    fun isWaiting(error: String): Boolean = error == WAIT_WIFI || error == WAIT_SCHEDULE
+    fun isWaiting(error: String): Boolean =
+        error == WAIT_WIFI || error == WAIT_SCHEDULE || error == WAIT_QUEUE
 
     /** 按文件名归类到 Download/ 下的子目录；空串表示根目录 */
     fun categoryOf(fileName: String): String {

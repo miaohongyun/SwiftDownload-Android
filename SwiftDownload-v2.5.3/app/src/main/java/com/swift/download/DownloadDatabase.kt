@@ -20,6 +20,8 @@ class DownloadDatabase private constructor(ctx: Context) :
         // v2.5：m3u8 任务选定的变体地址与来源页（重启恢复需要）
         db.execSQL("ALTER TABLE tasks ADD COLUMN variant TEXT NOT NULL DEFAULT ''")
         db.execSQL("ALTER TABLE tasks ADD COLUMN referer TEXT NOT NULL DEFAULT ''")
+        // v2.6.0：新建库也补齐 v4 列
+        MIGRATE_V4.forEach(db::execSQL)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -32,6 +34,11 @@ class DownloadDatabase private constructor(ctx: Context) :
             // v2 → v3：新增两列，老行补默认值
             db.execSQL("ALTER TABLE tasks ADD COLUMN variant TEXT NOT NULL DEFAULT ''")
             db.execSQL("ALTER TABLE tasks ADD COLUMN referer TEXT NOT NULL DEFAULT ''")
+        }
+        if (oldVersion < 4) {
+            // v3 → v4：登录态/UA 透传 + MediaStore 导出 URI。
+            // 全部 ALTER TABLE ADD COLUMN，老任务行原样保留。
+            MIGRATE_V4.forEach(db::execSQL)
         }
     }
 
@@ -50,6 +57,9 @@ class DownloadDatabase private constructor(ctx: Context) :
         cv.put("hash", task.hash)
         cv.put("variant", task.variant)
         cv.put("referer", task.referer)
+        cv.put("cookie", task.cookie)
+        cv.put("user_agent", task.userAgent)
+        cv.put("export_uri", task.exportUri)
         return writableDatabase.insert("tasks", null, cv)
     }
 
@@ -96,6 +106,14 @@ class DownloadDatabase private constructor(ctx: Context) :
         writableDatabase.update("tasks", cv, "id=?", arrayOf(id.toString()))
     }
 
+    /** v2.6.0：MediaStore 导出成功后记录可访问路径与 content URI */
+    fun markExported(id: Long, savePath: String, uri: String) {
+        val cv = ContentValues()
+        cv.put("save_path", savePath)
+        cv.put("export_uri", uri)
+        writableDatabase.update("tasks", cv, "id=?", arrayOf(id.toString()))
+    }
+
     /** v2.5.2：文件页重命名后同步任务记录（按旧路径匹配，可能 0 行） */
     fun renameSavePath(oldPath: String, newPath: String) {
         val cv = ContentValues()
@@ -118,7 +136,7 @@ class DownloadDatabase private constructor(ctx: Context) :
     fun all(): List<DownloadTask> {
         val out = ArrayList<DownloadTask>()
         readableDatabase.rawQuery(
-            "SELECT id,url,file_name,save_path,total_bytes,downloaded_bytes,status,threads,error,created_at,kind,hash,variant,referer FROM tasks ORDER BY id DESC",
+            "SELECT id,url,file_name,save_path,total_bytes,downloaded_bytes,status,threads,error,created_at,kind,hash,variant,referer,cookie,user_agent,export_uri FROM tasks ORDER BY id DESC",
             null
         ).use { c ->
             while (c.moveToNext()) {
@@ -136,7 +154,10 @@ class DownloadDatabase private constructor(ctx: Context) :
                     kind = c.getInt(10),
                     hash = c.getString(11) ?: "",
                     variant = c.getString(12) ?: "",
-                    referer = c.getString(13) ?: ""
+                    referer = c.getString(13) ?: "",
+                    cookie = c.getString(14) ?: "",
+                    userAgent = c.getString(15) ?: "",
+                    exportUri = c.getString(16) ?: ""
                 ))
             }
         }
@@ -145,7 +166,14 @@ class DownloadDatabase private constructor(ctx: Context) :
 
     companion object {
         const val DB_NAME = "swift_download.db"
-        const val DB_VERSION = 3
+        const val DB_VERSION = 4
+
+        /** v2.6.0：v3 → v4 的全部增量列（纯 ALTER，老数据零改动） */
+        val MIGRATE_V4 = listOf(
+            "ALTER TABLE tasks ADD COLUMN cookie TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE tasks ADD COLUMN user_agent TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE tasks ADD COLUMN export_uri TEXT NOT NULL DEFAULT ''"
+        )
 
         /** v1.0 建表语句原文（从 v1.0 APK 中逐字符提取） */
         const val CREATE_V1 = "CREATE TABLE tasks (\n" +

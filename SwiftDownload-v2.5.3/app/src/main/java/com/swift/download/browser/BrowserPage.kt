@@ -1,5 +1,7 @@
 package com.swift.download.browser
 
+import com.swift.download.HttpUtil
+
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Typeface
@@ -37,18 +39,20 @@ import java.io.File
 @SuppressLint("ViewConstructor", "SetJavaScriptEnabled")
 class BrowserPage(
     context: Context,
-    private val onNewDownload: (url: String, suggestedName: String, referer: String) -> Unit,
+    private val onNewDownload: (url: String, suggestedName: String, referer: String, cookie: String) -> Unit,
     private val onNewMagnet: (magnetUri: String) -> Unit,
     private val onOpenMagnetSearch: (keyword: String) -> Unit,
     /** 嗅探到页面视频：master 地址、建议文件名、来源页 Referer */
-    private val onVideoDetected: (url: String, name: String, referer: String) -> Unit
+    private val onVideoDetected: (url: String, name: String, referer: String, cookie: String) -> Unit
 ) : FrameLayout(context) {
 
     data class Tab(
         val id: Int,
         var title: String,
         var url: String,
-        var webView: WebView? = null
+        var webView: WebView? = null,
+        /** v2.6.0：本标签嗅探到的视频链接（url → 名称），角标与复核用 */
+        val sniffed: LinkedHashMap<String, String> = LinkedHashMap()
     )
 
     private var nextId = 1
@@ -102,15 +106,17 @@ class BrowserPage(
             "→" to { current?.webView?.goForward() },
             "⟳" to { current?.webView?.reload() },
             "⌂" to { goHome() },
-            "☆" to { bookmarkCurrentPage() }
+            "☆" to { bookmarkCurrentPage() },
+            "嗅探" to { showSniffSheet() }
         )) {
             val b = TextView(context).apply {
-                text = label; textSize = 18f
+                text = label; textSize = if (label == "嗅探") 12f else 18f
                 gravity = Gravity.CENTER
-                setTextColor(Ui.TXT)
-                setPadding(Ui.dp(context, 8f), Ui.dp(context, 6f), Ui.dp(context, 8f), Ui.dp(context, 6f))
+                setTextColor(if (label == "嗅探") Ui.BLUE else Ui.TXT)
+                setPadding(Ui.dp(context, 6f), Ui.dp(context, 6f), Ui.dp(context, 6f), Ui.dp(context, 6f))
                 setOnClickListener { act() }
             }
+            if (label == "嗅探") sniffBadge = b
             bar.addView(b)
         }
         root.addView(bar)
@@ -129,6 +135,47 @@ class BrowserPage(
 
     /** 宿主（返回键）需要：当前标签的 WebView */
     fun currentWebView(): WebView? = current?.webView
+
+    /* v2.6.0：宿主生命周期转发，防止退出后网页后台音视频仍在播放 */
+    fun onHostPause() { tabs.mapNotNull { it.webView }.forEach { it.onPause() } }
+    fun onHostResume() { tabs.mapNotNull { it.webView }.forEach { it.onResume() } }
+    fun onHostDestroy() { tabs.mapNotNull { it.webView }.forEach { it.destroy() } }
+
+    /** v2.6.0：嗅探结果角标（数量 = 当前标签去重后的视频链接数） */
+    private var sniffBadge: TextView? = null
+
+    private fun refreshSniffBadge() {
+        val b = sniffBadge ?: return
+        val n = current?.sniffed?.size ?: 0
+        b.text = "嗅探($n)"
+        b.visibility = if (n > 0) VISIBLE else GONE
+    }
+
+    private fun showSniffSheet() {
+        val ctx = context
+        val links = (current?.sniffed?.toList()) ?: emptyList()
+        if (links.isEmpty()) {
+            Ui.toast(ctx, "当前页面未嗅探到视频")
+            return
+        }
+        val items = links.map { (url, name) -> "$name  ·  ${url.substringBefore('?').substringAfterLast('/')}" }
+        android.app.AlertDialog.Builder(ctx)
+            .setTitle("嗅探结果（${links.size}）")
+            .setItems(items.toTypedArray()) { _, which ->
+                val (url, name) = links[which]
+                showVideoSheet(url, name, current?.url.orEmpty(), cookieFor(url))
+            }
+            .setNeutralButton("全部下载") { _, _ ->
+                val page = current?.url.orEmpty()
+                for ((url, name) in links) {
+                    if (VideoSniff.isMp4(url)) confirmDownload(url, name)
+                    else onVideoDetected(url, name, page, cookieFor(url))
+                }
+                Ui.toast(ctx, "已添加 ${links.size} 个视频任务")
+            }
+            .setNegativeButton("关闭", null)
+            .show()
+    }
 
     fun newTab(url: String? = null): Tab {
         val t = Tab(nextId++, "新标签页", url ?: HOME_URL)
@@ -158,6 +205,7 @@ class BrowserPage(
         for (other in tabs) {
             other.webView?.visibility = if (other === t) VISIBLE else GONE
         }
+        refreshSniffBadge()
         renderTabs()
         if (t.url == HOME_URL || t.url.isBlank()) {
             homepage.visibility = VISIBLE
@@ -232,8 +280,7 @@ class BrowserPage(
         s.builtInZoomControls = true
         s.displayZoomControls = false
         s.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
-        s.userAgentString =
-            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
+        s.userAgentString = HttpUtil.USER_AGENT
         wv.setBackgroundColor(0xFFFFFFFF.toInt())
     }
 
@@ -249,10 +296,14 @@ class BrowserPage(
             val url = request.url.toString()
             if (VideoSniff.isCandidate(url)) {
                 val page = t.url.ifBlank { url }
-                if (sniffKey != page) {
+                // v2.6.0：无论是否弹窗都记录到本标签，关闭弹窗后仍可从角标重新查看
+                val isNew = !t.sniffed.containsKey(url)
+                t.sniffed[url] = VideoSniff.displayName(url)
+                if (t === current) post { refreshSniffBadge() }
+                if (isNew && sniffKey != page) {
                     sniffKey = page
                     post {
-                        if (t === current) showVideoSheet(url, VideoSniff.displayName(url), page)
+                        if (t === current) showVideoSheet(url, VideoSniff.displayName(url), page, cookieFor(url))
                     }
                 }
             }
@@ -299,12 +350,32 @@ class BrowserPage(
         confirmDownload(url, name)
     }
 
+    /**
+     * v2.6.0：从 WebView 的 CookieManager 抓取目标地址与来源页的登录态。
+     * 两处的同名 Cookie 以目标地址优先，避免来源页旧值覆盖。
+     */
+    private fun cookieFor(url: String): String {
+        val manager = try { CookieManager.getInstance() } catch (e: Exception) { return "" }
+        val page = current?.url.orEmpty()
+        val out = LinkedHashMap<String, String>()
+        for (host in listOf(url, page).filter { it.isNotBlank() }) {
+            val raw = try { manager.getCookie(host).orEmpty() } catch (e: Exception) { "" }
+            for (item in raw.split(';')) {
+                val pair = item.trim()
+                val i = pair.indexOf('=')
+                if (i > 0) out.putIfAbsent(pair.substring(0, i).trim(), pair.substring(i + 1).trim())
+            }
+        }
+        return out.entries.joinToString("; ") { "${it.key}=${it.value}" }
+    }
+
     private fun confirmDownload(url: String, name: String) {
         val referer = current?.url.orEmpty()
+        val cookie = cookieFor(url)
         android.app.AlertDialog.Builder(context)
             .setTitle("下载文件")
             .setMessage("$name\n\n已接管为多线程下载，支持断点续传。")
-            .setPositiveButton("下载") { _, _ -> onNewDownload(url, name, referer) }
+            .setPositiveButton("下载") { _, _ -> onNewDownload(url, name, referer, cookie) }
             .setNegativeButton("取消", null)
             .show()
     }
@@ -324,7 +395,7 @@ class BrowserPage(
      *  - m3u8 → 后台抓一次 playlist，列出各档清晰度，用户选定后把变体地址交给下载服务
      * 抓 playlist 失败（签名/网络）时退化为"按原始地址下载"，交由引擎自动选档。
      */
-    private fun showVideoSheet(url: String, name: String, referer: String) {
+    private fun showVideoSheet(url: String, name: String, referer: String, cookie: String = "") {
         if (VideoSniff.isMp4(url)) {
             confirmDownload(url, name)
             return
@@ -353,7 +424,8 @@ class BrowserPage(
                 conn.connectTimeout = 10000
                 conn.readTimeout = 15000
                 conn.setRequestProperty("Referer", referer)
-                conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124 Mobile Safari/537.36")
+                conn.setRequestProperty("User-Agent", HttpUtil.USER_AGENT)
+                if (cookie.isNotBlank()) conn.setRequestProperty("Cookie", cookie)
                 val text = try {
                     conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
                 } finally {
@@ -370,7 +442,7 @@ class BrowserPage(
                     status.text = "未能解析出清晰度列表，将按原始地址下载（引擎自动选最高档）。"
                     list.addView(Ui.pillBtn(ctx, "下载视频", Ui.BLUE, filled = true) {
                         dialog.dismiss()
-                        onVideoDetected(url, name, referer)
+                        onVideoDetected(url, name, referer, cookieFor(url))
                     })
                 } else {
                     status.text = "选择清晰度（${variants.size} 档）："
@@ -386,7 +458,7 @@ class BrowserPage(
                         row.addView(line)
                         row.setOnClickListener {
                             dialog.dismiss()
-                            onVideoDetected(v.url, name, referer)
+                            onVideoDetected(v.url, name, referer, cookieFor(v.url))
                         }
                         list.addView(row, LinearLayout.LayoutParams(
                             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT

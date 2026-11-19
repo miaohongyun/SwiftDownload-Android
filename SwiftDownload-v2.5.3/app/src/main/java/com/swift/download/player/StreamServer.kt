@@ -1,5 +1,6 @@
 package com.swift.download.player
 
+import com.swift.download.HttpUtil
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
@@ -138,6 +139,7 @@ class TaskBacking(
     private val total: Long,
     private val mime: String,
     private val referer: String = "",
+    private val cookie: String = "",
     private val externalWrite: (offset: Long, buf: ByteArray, len: Int) -> Boolean,
     private val segments: () -> Map<Long, Long>
 ) : Backing {
@@ -163,6 +165,12 @@ class TaskBacking(
     private var streamPos = -1L    // 流当前实际读到的位置（v2.5.1：skip 必须基于实时位置计算）
     private var streamEnd = -1L     // 当前流覆盖到的末尾偏移（闭区间）
 
+    /**
+     * v2.6.0：多连接播放器会同时发不同 Range，而 streamPos/conn/stream 是这条
+     * 长连接的共享状态。两个 fetch 并发进入 reopen() 会互相把状态改掉，
+     * 轻则数据错位，重则一个连接读到另一个连接的偏移。整段读取与 close 互斥。
+     */
+    @Synchronized
     override fun fetch(offset: Long, out: ByteArray, len: Int): Int {
         var got = 0
         while (got < len) {
@@ -199,16 +207,11 @@ class TaskBacking(
     /** 以 [from] 为起点重新建立一条 Range 连接 */
     private fun reopen(from: Long) {
         closeStream()
-        val c = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+        // v2.6.0：统一走 HttpUtil —— 手动跟随 301/302/303/307/308（含跨协议），
+        // 且每一跳都重新带上 Range/Referer/UA，避免重定向后数据错位。
+        val extra = if (cookie.isNotBlank()) mapOf("Cookie" to cookie) else emptyMap()
+        val c = HttpUtil.open(url, referer, "bytes=$from-", extraHeaders = extra)
         try {
-            c.connectTimeout = 15000
-            c.readTimeout = 30000
-            c.setRequestProperty("Range", "bytes=$from-")
-            c.setRequestProperty(
-                "User-Agent",
-                "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124 Mobile Safari/537.36"
-            )
-            if (referer.isNotBlank()) c.setRequestProperty("Referer", referer)
             val code = c.responseCode
             if (code != 200 && code != 206) throw IOException("HTTP $code")
             val cr = c.getHeaderField("Content-Range")
@@ -238,6 +241,7 @@ class TaskBacking(
         streamEnd = -1L
     }
 
+    @Synchronized
     override fun close() {
         closeStream()
     }
@@ -335,7 +339,10 @@ class StreamServer(
             val input = client.getInputStream()
             val out = client.getOutputStream()
             val requestLine = readLine(input) ?: run { client.close(); return }
-            if (!requestLine.startsWith("GET")) {
+            // v2.6.0：播放器/电视的探测请求常用 HEAD，只取响应头不取 body。
+            val isGet = requestLine.startsWith("GET ")
+            val isHead = requestLine.startsWith("HEAD ")
+            if (!isGet && !isHead) {
                 client.close(); return
             }
             var rangeHeader: String? = null
@@ -351,6 +358,9 @@ class StreamServer(
             val range = StreamMath.parseRange(rangeHeader, backing.total())
             if (range.isEmpty()) {
                 respond(out, 416, mapOf(
+                    "Content-Type" to backing.contentType(),
+                    "Content-Length" to "0",
+                    "Accept-Ranges" to "bytes",
                     "Content-Range" to "bytes */${backing.total()}",
                     "Connection" to "close"
                 ), null)
@@ -368,7 +378,9 @@ class StreamServer(
             }
             headers["Connection"] = if (keepAlive) "keep-alive" else "close"
             respond(out, status, headers, null)
-            pump(out, range[0], range[1] + 1)
+            // HEAD：响应头与 GET 完全一致（含 Content-Length / Content-Range / Accept-Ranges），
+            // 但绝不写 body，也不触发远端拉取，避免探测请求把任务数据拉一遍。
+            if (isGet) pump(out, range[0], range[1] + 1)
             out.flush()
         } catch (e: Exception) {
             // 播放器断开 / 网络错误：静默

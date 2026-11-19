@@ -78,6 +78,22 @@ class DlnaParseTest {
         assertTrue(!soap.contains("1&y=2\"")) // 原样 & 不出现于 XML 文本节点
     }
 
+    @Test fun `didlLite 含标准元数据且被 SOAP 整体转义`() {
+        val didl = Dlna.didlLite("http://192.168.1.9:39521/file?x=1", "复仇者联盟.mp4")
+        assertTrue(didl.contains("<DIDL-Lite"))
+        assertTrue(didl.contains("xmlns:dc="))
+        assertTrue(didl.contains("<dc:title>复仇者联盟.mp4</dc:title>"))
+        assertTrue(didl.contains("object.item.videoItem"))
+        assertTrue(didl.contains("http-get:*:video/mp4:*"))
+        assertTrue(didl.contains("x=1"))
+
+        val soap = Dlna.buildSetUriSoap("http://192.168.1.9:39521/file?x=1", "复仇者联盟.mp4")
+        // DIDL 作为文本节点必须整体转义：尖括号不能裸出现，转义后的串要存在
+        assertTrue("SOAP 不得含裸 DIDL 标签", !soap.contains("<DIDL-Lite"))
+        assertTrue(soap.contains("&lt;DIDL-Lite"))
+        assertTrue(soap.contains("&lt;dc:title&gt;"))
+    }
+
     @Test fun `escapeXml 五类字符`() {
         assertEquals("&amp;&lt;&gt;&quot;&apos;", Dlna.escapeXml("&<>\"'"))
     }

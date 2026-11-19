@@ -29,7 +29,9 @@ class DownloadSettingsPage(
         root.addView(speedCard())
         root.addView(networkCard())
         root.addView(scheduleCard())
+        root.addView(concurrencyCard())
         root.addView(categoryCard())
+        root.addView(exportCard())
         root.addView(proxyCard())
 
         val close = Ui.pillBtn(context, "完成", Ui.BLUE, filled = true) { onClose() }
@@ -54,6 +56,7 @@ class DownloadSettingsPage(
         card.addView(Ui.text(context, "限速", 15f, Ui.TXT, bold = true))
         val row = LinearLayout(context).apply { orientation = HORIZONTAL; gravity = android.view.Gravity.CENTER_VERTICAL }
         val et = Ui.singleLineEt(context, "0 = 不限速").apply {
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
             val current = settings.globalLimitBps
             setText(if (current > 0) (current / 1024 / 1024).toString() else "0")
         }
@@ -107,9 +110,11 @@ class DownloadSettingsPage(
         })
         val row = LinearLayout(context).apply { orientation = HORIZONTAL; gravity = android.view.Gravity.CENTER_VERTICAL }
         val start = Ui.singleLineEt(context, "0").apply {
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
             setText((settings.scheduleStartMinute / 60).toString())
         }
         val end = Ui.singleLineEt(context, "24").apply {
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
             setText((settings.scheduleEndMinute / 60).toString())
         }
         row.addView(start, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
@@ -163,7 +168,9 @@ class DownloadSettingsPage(
         })
         val row = LinearLayout(context).apply { orientation = HORIZONTAL; gravity = android.view.Gravity.CENTER_VERTICAL }
         val host = Ui.singleLineEt(context, "127.0.0.1").apply { setText(settings.proxyHost) }
-        val port = Ui.singleLineEt(context, "7890").apply { setText(settings.proxyPort.toString()) }
+        val port = Ui.singleLineEt(context, "7890").apply {
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            setText(settings.proxyPort.toString()) }
         row.addView(host, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 2f))
         row.addView(port, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             .apply { marginStart = Ui.dp(context, 8f) })
@@ -186,6 +193,48 @@ class DownloadSettingsPage(
         card.addView(save, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = Ui.dp(context, 8f) })
+        card.layoutParams = cardLp()
+        return card
+    }
+
+    private fun concurrencyCard(): View {
+        val card = Ui.card(context)
+        card.addView(Ui.text(context, "最大同时下载任务数", 15f, Ui.TXT, bold = true))
+        val et = Ui.singleLineEt(context, "1-5").apply {
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            setText(settings.maxConcurrent.toString())
+        }
+        val row = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+        }
+        row.addView(et, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        row.addView(Ui.text(context, "个（1-5）", 12f, Ui.TXT_SUB),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { marginStart = Ui.dp(context, 8f) })
+        card.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = Ui.dp(context, 8f) })
+        card.addView(Ui.text(context, "超出的任务排队，每完成一个自动补位。", 11f, Ui.TXT_SUB),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = Ui.dp(context, 4f) })
+        card.addView(Ui.pillBtn(context, "保存", Ui.BLUE, filled = true) {
+            settings.maxConcurrent = et.text.toString().trim().toIntOrNull()
+                ?: com.swift.download.QueueRules.DEFAULT_CONCURRENT
+            Ui.toast(context, "最大同时下载：${settings.maxConcurrent} 个")
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = Ui.dp(context, 8f) })
+        card.layoutParams = cardLp()
+        return card
+    }
+
+    /** v2.6.0：Android 10+ 完成后导出到系统 Download/极速下载 */
+    private fun exportCard(): View {
+        val card = Ui.card(context)
+        card.addView(switchRow(context, "完成后导出到系统下载目录",
+            "Android 10+ 写入 Download/极速下载，文件管理器直接可见") { sw ->
+            sw.isChecked = settings.exportToPublicDownloads
+            sw.setOnCheckedChangeListener { _, checked -> settings.exportToPublicDownloads = checked }
+        })
         card.layoutParams = cardLp()
         return card
     }

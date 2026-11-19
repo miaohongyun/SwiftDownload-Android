@@ -87,6 +87,25 @@ class M3u8Test {
     }
 
     @Test
+    fun videoSniffSupportsMoreFormatsAndExtractsLinks() {
+        assertTrue(VideoSniff.isCandidate("https://x.test/a.MKV"))
+        assertTrue(VideoSniff.isCandidate("https://x.test/a.flv?t=1"))
+        assertTrue(VideoSniff.isCandidate("https://x.test/a.mov"))
+        assertTrue(VideoSniff.isCandidate("https://x.test/a.webm"))
+        assertFalse(VideoSniff.isCandidate("https://x.test/a.txt"))
+
+        val shared = "看这个 https://x.test/v/movie.mp4 或者 https://y.test/live/index.m3u8 谢谢！"
+        val links = VideoSniff.extractLinks(shared)
+        assertEquals(2, links.size)
+        assertTrue(links.contains("https://x.test/v/movie.mp4"))
+        assertTrue(links.contains("https://y.test/live/index.m3u8"))
+        val mixed = "复制链接：magnet:?xt=urn:btih:ABCDEF1234567890 口令 123456"
+        val mixedLinks = VideoSniff.extractLinks(mixed)
+        assertEquals(1, mixedLinks.size)
+        assertTrue(VideoSniff.isMagnet(mixedLinks[0]))
+    }
+
+    @Test
     fun videoProbeDetectsMoovNearStart() {
         assertTrue(VideoProbe.hasMoovNearStart("ftypisommoovtrakmdat".toByteArray()))
         assertFalse(VideoProbe.hasMoovNearStart("ftypisommdatonly".toByteArray()))
@@ -96,16 +115,31 @@ class M3u8Test {
     /* ---- v2.5.2：不支持的 HLS 特性必须被识别出来（否则会下出一个不可播放的"已完成"文件） ---- */
 
     @Test
-    fun detectsAesEncryptedSegments() {
+    fun aes128IsNowSupported() {
         val text = """
             #EXTM3U
-            #EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x1234
+            #EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x00000000000000000000000000000001
             #EXTINF:10.0,
             seg0.ts
         """.trimIndent()
         val p = M3u8.parse("https://site.test/v/index.m3u8", text)
-        assertTrue(p.unsupported != null)
-        assertTrue(p.unsupported!!.contains("AES-128"))
+        assertEquals(null, p.unsupported)
+        val seg = p.items.single()
+        assertEquals("AES-128", seg.key?.method)
+        assertEquals("https://site.test/v/key.bin", seg.key?.uri)
+        assertEquals("0x00000000000000000000000000000001", seg.key?.iv)
+    }
+
+    @Test
+    fun sampleAesIsStillRejected() {
+        val text = """
+            #EXTM3U
+            #EXT-X-KEY:METHOD=SAMPLE-AES,URI="key.bin"
+            #EXTINF:10.0,
+            seg0.ts
+        """.trimIndent()
+        assertTrue(M3u8.parse("https://site.test/v/index.m3u8", text)
+            .unsupported!!.contains("SAMPLE-AES"))
     }
 
     @Test
@@ -131,13 +165,38 @@ class M3u8Test {
     }
 
     @Test
-    fun detectsByteRangeSegments() {
+    fun byteRangeIsParsedWithImplicitOffset() {
         val text = """
             #EXTM3U
+            #EXT-X-MEDIA-SEQUENCE:7
             #EXTINF:10.0,
             #EXT-X-BYTERANGE:1000@0
             all.ts
+            #EXTINF:10.0,
+            #EXT-X-BYTERANGE:2000
+            all.ts
         """.trimIndent()
-        assertTrue(M3u8.parse("https://site.test/v/index.m3u8", text).unsupported!!.contains("BYTERANGE"))
+        val p = M3u8.parse("https://site.test/v/index.m3u8", text)
+        assertEquals(null, p.unsupported)
+        assertEquals(2, p.items.size)
+        assertEquals(M3u8.ByteRange(1000, 0), p.items[0].byteRange)
+        // 未写 @ 时紧接上一个分片：0 + 1000
+        assertEquals(M3u8.ByteRange(2000, 1000), p.items[1].byteRange)
+        assertEquals(7L, p.items[0].sequence)
+        assertEquals(8L, p.items[1].sequence)
+    }
+
+    @Test
+    fun keyScopeResetsWithMethodNone() {
+        val text = """
+            #EXTM3U
+            #EXT-X-KEY:METHOD=AES-128,URI="k.bin"
+            a.ts
+            #EXT-X-KEY:METHOD=NONE
+            b.ts
+        """.trimIndent()
+        val p = M3u8.parse("https://site.test/v/index.m3u8", text)
+        assertEquals("AES-128", p.items[0].key?.method)
+        assertEquals(null, p.items[1].key)
     }
 }

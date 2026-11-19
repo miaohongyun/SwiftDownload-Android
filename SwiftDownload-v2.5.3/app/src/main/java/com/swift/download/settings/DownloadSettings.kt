@@ -50,6 +50,20 @@ class DownloadSettings private constructor(ctx: Context) {
         get() = prefs.getBoolean(KEY_M3U8, true)
         set(value) = prefs.edit().putBoolean(KEY_M3U8, value).apply()
 
+    /** v2.6.0：最大同时下载任务数（1..5，默认 3） */
+    var maxConcurrent: Int
+        get() = com.swift.download.QueueRules.normalize(
+            prefs.getInt(KEY_MAX_CONCURRENT, com.swift.download.QueueRules.DEFAULT_CONCURRENT)
+        )
+        set(value) = prefs.edit().putInt(
+            KEY_MAX_CONCURRENT, com.swift.download.QueueRules.normalize(value)
+        ).apply()
+
+    /** v2.6.0：完成后导出到公共 Download/极速下载（默认开） */
+    var exportToPublicDownloads: Boolean
+        get() = prefs.getBoolean(KEY_EXPORT_PUBLIC, true)
+        set(value) = prefs.edit().putBoolean(KEY_EXPORT_PUBLIC, value).apply()
+
     var proxyEnabled: Boolean
         get() = prefs.getBoolean(KEY_PROXY_ON, false)
         set(value) = prefs.edit().putBoolean(KEY_PROXY_ON, value).apply()
@@ -90,6 +104,8 @@ class DownloadSettings private constructor(ctx: Context) {
         private const val KEY_SCHEDULE_END = "schedule_end"
         private const val KEY_CATEGORY = "auto_category"
         private const val KEY_M3U8 = "m3u8_enabled"
+        private const val KEY_MAX_CONCURRENT = "max_concurrent"
+        private const val KEY_EXPORT_PUBLIC = "export_public_downloads"
         private const val KEY_PROXY_ON = "proxy_enabled"
         private const val KEY_PROXY_HOST = "proxy_host"
         private const val KEY_PROXY_PORT = "proxy_port"

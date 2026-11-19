@@ -16,6 +16,11 @@ object VideoSniff {
     fun isMp4(url: String): Boolean =
         pathOf(url).endsWith(".mp4", ignoreCase = true)
 
+    /** v2.6.0：除 mp4/m3u8 外还支持 mkv/flv/mov/webm 的直接嗅探 */
+    private val OTHER_VIDEO_EXT = setOf("mkv", "flv", "mov", "webm")
+    fun isOtherVideo(url: String): Boolean =
+        OTHER_VIDEO_EXT.contains(pathOf(url).substringAfterLast('.', "").lowercase())
+
     /** TS 分片本身不单独作为下载候选（它属于某个 m3u8） */
     private fun isTs(url: String): Boolean =
         pathOf(url).endsWith(".ts", ignoreCase = true) ||
@@ -23,7 +28,24 @@ object VideoSniff {
 
     /** 是否值得作为"可下载视频"候选展示给用户 */
     fun isCandidate(url: String): Boolean =
-        (isM3u8(url) || isMp4(url)) && !isTs(url) && url.startsWith("http", true)
+        (isM3u8(url) || isMp4(url) || isOtherVideo(url)) &&
+            !isTs(url) && url.startsWith("http", true)
+
+    /**
+     * v2.6.0：从整段分享文案里提取链接（直链 + 磁力），用于剪贴板智能识别。
+     * 只取明确的 http(s):// 与 magnet:?xt=urn:btih:，不误伤中文文案与普通域名。
+     */
+    fun extractLinks(text: String): List<String> {
+        val out = LinkedHashMap<String, Boolean>()
+        val http = Regex("""https?://[^\s<>"'，。；）)\]]+""", RegexOption.IGNORE_CASE)
+        for (m in http.findAll(text)) out.putIfAbsent(m.value.trimEnd('.', ',', ';'), false)
+        val magnet = Regex("""magnet:\?xt=urn:btih:[^\s<>"'，。；）)\]]+""", RegexOption.IGNORE_CASE)
+        for (m in magnet.findAll(text)) out.putIfAbsent(m.value, true)
+        return out.keys.toList()
+    }
+
+    fun isMagnet(text: String): Boolean =
+        text.startsWith("magnet:?xt=urn:btih:", ignoreCase = true)
 
     /** 从 URL 推断一个可读的文件名 */
     fun displayName(url: String): String {

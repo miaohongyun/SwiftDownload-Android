@@ -211,6 +211,7 @@ class FilesPage(
             opts.add("分享" to { share(f) })
             if (MediaTypes.isVideoName(f.name)) opts.add("投屏播放" to { onCast(f.absolutePath) })
             opts.add("重命名" to { rename(f) })
+            opts.add("校验哈希 / 详情" to { com.swift.download.HashDialog.show(ctx, f) })
             opts.add("删除" to {
                 android.app.AlertDialog.Builder(ctx)
                     .setMessage("删除「${f.name}」？此操作不可恢复。")
@@ -258,6 +259,12 @@ class FilesPage(
                     // 之后任务里的 save_path 就指向了一个不存在的位置（打开/投屏全部失败）
                     if (n.contains('/') || n.contains('\\') || n == "." || n == "..") {
                         Ui.toast(ctx, "文件名不能包含路径分隔符")
+                        return@setPositiveButton
+                    }
+                    // v2.6.0：拒绝以 . 开头的隐藏文件（与用户手册描述对齐），
+                    // 否则文件会从文件管理器/相册里"消失"，用户以为下载丢了
+                    if (n.startsWith('.')) {
+                        Ui.toast(ctx, "文件名不能以 . 开头（隐藏文件）")
                         return@setPositiveButton
                     }
                     val target = File(f.parentFile, n)
