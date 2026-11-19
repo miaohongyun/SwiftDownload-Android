@@ -13,7 +13,8 @@ import java.util.concurrent.TimeUnit
  * v2.8 模块四 4.2：离屏 WebView HTML 抓取兜底。
  *
  * 针对返回空壳 HTML（前端 JS 渲染）或 403（Cloudflare JS 挑战）的磁力源：
- * 复用进程全局的 CookieManager 与 ProxyController（BrowserPage 已配置），
+ * 复用进程全局的 CookieManager 与 WebView 代理（由 WebViewProxyManager 统一配置）——
+ * 本类绝不调用 setProxyOverride/clearProxyOverride，避免覆盖掉主浏览器的全局代理设置；
  * 在主线程创建隐藏 WebView，等 DOM 渲染出 magnet 后提取 outerHTML 交 [MagnetParsers]。
  *
  * 注意：WebView 必须在主线程创建/销毁；IO 线程用 CountDownLatch 等待，超时 [timeoutMs]。

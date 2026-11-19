@@ -17,9 +17,6 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.webkit.SslErrorHandler
 import android.net.http.SslError
-import androidx.webkit.ProxyConfig
-import androidx.webkit.ProxyController
-import androidx.webkit.WebViewFeature
 import android.text.Editable
 import android.text.TextWatcher
 import android.widget.EditText
@@ -228,31 +225,12 @@ class BrowserPage(
     }
 
     /**
-     * v2.8 模块三：让 Chromium WebView 真正走 App 设置的 HTTP 代理。
-     * 此前只设置了 HttpURLConnection 的 ProxySelector，WebView 内置网络栈完全不走代理，
-     * 导致"开了代理却依然打不开境外/屏蔽站点"。用 ProxyController 全局生效并做特性检测防低版本崩溃。
+     * 让 Chromium WebView 走 App 代理。统一委托进程级单一入口 [WebViewProxyManager]：
+     * 主线程执行 + main executor 回调 + 特性检测 + 仅配置变化时触发。
+     * 保留方法名是兼容 MainActivity 设置页关闭时的调用。
      */
     fun applyWebViewProxy() {
-        try {
-            if (!WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) return
-            val executor = java.util.concurrent.Executors.newSingleThreadExecutor { t ->
-                Thread(t, "wv-proxy").apply { isDaemon = true }
-            }
-            if (settings.proxyEnabled && settings.proxyHost.isNotBlank()) {
-                val rule = "http://${settings.proxyHost}:${settings.proxyPort}"
-                val config = ProxyConfig.Builder()
-                    .addProxyRule(rule)
-                    .addDirect() // 直连兜底，避免本地资源也走代理
-                    .build()
-                ProxyController.getInstance().setProxyOverride(config, executor) { }
-                Ui.toast(context, "浏览器已走代理：${settings.proxyHost}:${settings.proxyPort}")
-            } else {
-                ProxyController.getInstance().clearProxyOverride(executor) { }
-            }
-            executor.shutdown()
-        } catch (e: Exception) {
-            android.util.Log.w("BrowserPage", "applyWebViewProxy", e)
-        }
+        WebViewProxyManager.apply(context)
     }
 
     /** v2.8 模块二：底部工具栏（后退/前进/刷新/添加书签/首页或标签） */
