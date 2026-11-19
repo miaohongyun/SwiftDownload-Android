@@ -10,6 +10,7 @@
 6. v2.5.3 代码清理与文档
 7. v2.6.0 四阶段 + 交叉检查
 8. v2.7.0 五阶段 + 总验收门禁
+9. v2.8.0 模块一到五真机问题驱动重构
 
 > v2.3 ~ v2.5 的改动当时未单独归档回归章节；其修复清单见 [CHANGELOG.md](CHANGELOG.md)，
 > v2.5.2 一节也复核了 v2.5.1 声称"82/82 通过"与本机实测不符的问题。
@@ -385,3 +386,46 @@ E2E-A 的 `.part` 残留并非断言写错：`segDone()` 在 `RandomAccessFile` 
    锚点写法；测试期望由"去子域"改为真实 host，匹配交给规则。
 5. **网络 stub 用例偶发端口竞争**：`DownloadIntegrityTest` 的 404 用例在全量并行时偶发失败，
    单类重跑通过，与本轮改动无关，记录为已知 flaky。
+
+---
+
+# v2.8.0 增量回归（模块一到五 · 真机问题驱动）
+
+- 触发背景：真机实测暴露「BT 任务 0 B/s 不下」「浏览器打不开影视站」「磁力搜不到资源」三类阻塞问题。
+- 用例增长：v2.7.0 的 184 → 模块一二三 191 → 模块四 200。
+- 最终门禁：**200/200 通过，0 失败 0 跳过**；`lintDebug` 0 Error / 40 Warning；`assembleRelease` 成功。
+- 严格遵守「所有属性声明在 init 块前」铁律，`SourceLayoutGuardTest` 全程通过。
+
+## 分模块验证要点
+
+| 模块 | 新增测试 | 关键断言 |
+| --- | --- | --- |
+| 一（BT） | Stage28LogicTest（DHT 常量/参数构造） | io 线程池不再是单线程、DHT 引导节点非空、诊断字段映射 |
+| 二/三（浏览器/WebView） | Stage28LogicTest（书签/广告规则） | 极简首页结构、ProxyOverride 特性检测分支、DOM 注入 JS 生成 |
+| 四（磁力） | MagnetV28Test 9 | 自定义源校验、纯 JSON 往返含转义、异常→诊断状态、离屏结果合并去重、DOM 四类资源提取与去重 |
+
+## 本阶段发现并修复的真实问题
+
+1. **自定义源 JSON 往返为 0 条**：手写 `strField` 找到冒号后未 `p++` 跳过冒号，
+   导致所有字段解析返回 null。修复后 2 条源（含转义引号名称）正常往返。
+2. **离屏合并体积取值错误**：`mergeFallback` 保留旧体积（100）而非取最大（999），
+   改 `maxOf(old, new)` 后与聚合规则一致。
+3. **Kotlin 递归类型推断**（模块三遗留）：`chrome()` 内 `onCreateWindow` 又调 `chrome()`，
+   需显式声明返回类型 `WebChromeClient`（已在模块三处理）。
+4. **成员顺序铁律守护**：新增 `MagnetSearchPage.detailExpanded`、`BrowserPage.btnGrab` 等字段
+   全部置于 init 之前，`SourceLayoutGuardTest` 自动核查通过。
+
+## 总验收门禁（模块五）
+
+1. 版本升至 `versionCode 13 / versionName 2.8.0`。
+2. 三道门禁：`testDebugUnitTest` 200 通过；`lintDebug` 0 Error；`assembleRelease` 成功。
+3. APK 核验（`aapt2`/`apksigner`，build-tools 36.0.0）：
+   - `versionCode=13`、`versionName=2.8.0`、`targetSdk=36`；
+   - `native-code: arm64-v8a / armeabi-v7a`；
+   - APK Signature Scheme **v2 验证通过**，1 个签名者 `CN=SwiftDownload`（RSA 2048）。
+
+## 待真机验证项（非 JVM 可覆盖）
+
+- BT 磁力任务能否冲破 0 B/s（DHT 节点连接 + 元数据到达）。
+- 浏览器底部工具栏与代理开关是否生效、`.torrent` 链接是否直接建 BT 任务。
+- 一键抓资源在电影港/高清族等站点的命中率；离屏兜底对被拦截源的实际改善。

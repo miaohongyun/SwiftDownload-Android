@@ -372,3 +372,50 @@ init 里构建筛选胶囊时 `labelOf()` → `TaskFilters.counts(lastTasks)` �
   直接把堆栈显示在屏幕上，无需 adb；定位完成后移除诊断代码。
 - 任何改动页面类构造函数/init 块的行为，必须真机全新安装（非覆盖升级）验证一次启动流程，
   因为全新安装才会走 `onCreate` + 属性初始化的完整时序。
+
+---
+
+# v2.8.0 架构增量（真实用性重构）
+
+## 模块一：BT 下载能力修复
+
+- **会话线程模型**：`TorrentEngine.io` 从 `newSingleThreadExecutor()` 改为 `cachedThreadPool`；
+  移除 `fetchMagnet()`（阻塞占唯一线程 180 秒 + 与 `session.download()` 双重添加句柄冲突），
+  改为纯事件驱动：`session.download(magnetUri, saveDir)` 建任务，`METADATA_RECEIVED` alert 回填元数据，
+  `ScheduledExecutorService` 180 秒非阻塞超时检查 `pendingMeta` 集合。
+- **网络穿透**：`SettingsPack` 补 DHT 4 引导节点、`setBoolean` 开 LSD/UPnP/NAT-PMP、
+  `announce_to_all_trackers/tiers`、连接上限 200、缓存 16MB；代理未启用时显式清配置。
+- **诊断透出**：`BtProgress` 增 `dhtNodes/stateLabel/trackerError`（`session.dhtNodes()`/`st.state()`/`st.errorCode()`）；
+  Binder 暴露 `BtDiag`，任务卡/详情展示 DHT/节点/做种/Tracker。
+- **状态机**：`DownloadService.ticker()` 中 `hasMetadata=false && downloaded=0` 保持 `PROBING`，
+  不再误导翻 `RUNNING`。`.torrent` 链接走 `onTorrentLink → addTorrentFromUrl` 直接建 BT 任务；
+  HTTP 失败加「单线程重试」（`restartTask` 增 threadsOverride 参数）。
+
+## 模块二/三：浏览器体验与 WebView 修复
+
+- **单手 chrome**：极简首页（磁力搜按钮 + 3 列书签方块）；网页态紧凑标题栏点击展开地址栏；
+  底部 6 键工具栏（前进后退置灰/刷新/收藏确认框/首页长按标签面板/抓资源）；`applyChromeMode()` 统一切换。
+- **WebView 走代理**：`ProxyController.setProxyOverride` 配 `WebViewFeature.PROXY_OVERRIDE` 特性检测，
+  设置页关闭即时重应用；`onCreateWindow` 用户手势 `target=_blank` 正确开新标签；
+  `onReceivedSslError` 询问 + 会话记忆 host；`onReceivedError` 主框架内置错误引导页。
+- **广告 DOM 注入**：`AdBlocker.domInjectionJs(strong)` 生成 CSS 隐藏 + 点击劫持防御 JS，
+  `onPageFinished` 注入一次；`adBlockStrong` 设置默认关闭并纳入备份白名单。
+
+## 模块四：磁力可用性
+
+| 模块 | 职责 |
+| --- | --- |
+| `magnet/MagnetSourceRules` | 自定义源校验/稳定 id/解析规则归一化、纯 Kotlin JSON 编解码（不依赖 org.json）、诊断文案（纯逻辑） |
+| `magnet/OffscreenHtmlFetcher` | 空壳/403 源兜底：主线程隐藏 WebView 复用 Cookie/代理，轮询检测 magnet 渲染后提取 outerHTML，12 秒超时 |
+| `player/VideoSniff.extractPageResources` | DOM 批量提取 magnet/.torrent/ed2k/40 位 hash，结合附近标题，按 uri 去重（纯逻辑） |
+| `MagnetSearch.SourceOutcome` | 每源诊断状态（OK/空壳/403/超时/网络/解析）+ `mergeFallback` 去重合并离屏结果 |
+
+- `MagnetSourceStore` 支持自定义源增删与纯 Kotlin JSON 持久化（独立于内置源 override 文件）；
+  源管理页加添加/删除/连通性测试，搜索页状态栏展开每源明细。
+
+## 测试策略增量
+
+- 单测 184 → **200**：新增 Stage28Logic（6，模块一二三）+ MagnetV28Test（9，模块四）。
+  `SourceLayoutGuardTest` 全程守护「属性必须在 init 前」铁律。
+- 纯逻辑零依赖：`MagnetSourceRules` 手写 JSON 编解码规避 org.json JVM stub，
+  与 v2.7 的 `BackupCodec` 同一设计取向。

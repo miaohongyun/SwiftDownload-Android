@@ -16,6 +16,7 @@ import com.swift.download.Format
 import com.swift.download.ui.Ui
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -36,8 +37,10 @@ class MagnetSearchPage(
     private val etKeyword: EditText
     private val tvStatus: TextView
     private val rv: RecyclerView
+    private val detailPanel: LinearLayout
     private val adapter = ResultAdapter()
     private var lastReport: MagnetSearch.SearchReport? = null
+    private var detailExpanded = false
 
     init {
         setBackgroundColor(Ui.BG)
@@ -72,6 +75,12 @@ class MagnetSearchPage(
         header.addView(tvStatus, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
             setMargins(Ui.dp(context, 4f), Ui.dp(context, 10f), Ui.dp(context, 4f), Ui.dp(context, 6f))
         })
+        tvStatus.setOnClickListener {
+            detailExpanded = !detailExpanded
+            renderDetail()
+        }
+        detailPanel = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL; visibility = View.GONE }
+        header.addView(detailPanel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         rv = Ui.recyclerView(context)
         rv.adapter = adapter
 
@@ -96,19 +105,56 @@ class MagnetSearchPage(
         val sources = store.enabled()
         scope.launch {
             val report = withContext(Dispatchers.IO) {
-                MagnetSearch.search(kw, sources, MagnetSearch.defaultFetcher())
+                val first = MagnetSearch.search(kw, sources, MagnetSearch.defaultFetcher())
+                // v2.8 模块四 4.2：对空壳/被拦截源启用离屏 WebView 等 JS 渲染后兜底
+                val fallbackIds = first.outcomes
+                    .filter { it.status != MagnetSearch.SourceStatus.OK }
+                    .map { it.sourceId }
+                if (fallbackIds.isEmpty()) return@withContext first
+                val fallbackRaw = LinkedHashMap<String, List<MagnetParsers.RawItem>>()
+                for (s in sources.filter { it.id in fallbackIds }) {
+                    val html = OffscreenHtmlFetcher.fetch(context, s.urlFor(kw))
+                    if (!html.isNullOrBlank()) {
+                        val items = MagnetParsers.parse(s.parser, html)
+                        if (items.isNotEmpty()) fallbackRaw[s.id] = items
+                    }
+                }
+                MagnetSearch.mergeFallback(first, fallbackRaw)
             }
             lastReport = report
             adapter.submit(report.results)
             tvStatus.text = buildString {
                 append("找到 ${report.results.size} 条")
                 if (report.okSources.isNotEmpty()) append(" · ${report.okSources.size}/${sources.size} 源在线")
-                if (report.failedSources.isNotEmpty()) append(" · 失效源自动跳过 ${report.failedSources.size} 个")
+                if (report.failedSources.isNotEmpty()) append(" · 失效 ${report.failedSources.size} 个")
+                append(" · 点此看各源明细")
             }
+            renderDetail()
         }
     }
 
-    fun destroy() { /* scope 由宿主管理 */ }
+    /** v2.8 模块四：点状态栏展开每个源的命中/超时/拦截明细 */
+    private fun renderDetail() {
+        detailPanel.removeAllViews()
+        val report = lastReport
+        if (!detailExpanded || report == null) {
+            detailPanel.visibility = View.GONE
+            return
+        }
+        detailPanel.visibility = View.VISIBLE
+        if (report.outcomes.isEmpty()) {
+            detailPanel.addView(Ui.text(context, "暂无源明细，先搜索一次", 11f, Ui.TXT_SUB))
+            return
+        }
+        val names = store.sources().associate { it.id to it.name }
+        for (o in report.outcomes) {
+            val label = MagnetSourceRules.statusLabel(o.status, o.count)
+            val color = if (o.status == MagnetSearch.SourceStatus.OK && o.count > 0) Ui.BLUE else Ui.TXT_SUB
+            detailPanel.addView(Ui.text(context, "· ${names[o.sourceId] ?: o.sourceId}：$label", 11f, color))
+        }
+    }
+
+    fun destroy() { scope.cancel() }
 
     private inner class ResultAdapter : RecyclerView.Adapter<ResultVh>() {
         private val items = ArrayList<MagnetSearch.Result>()

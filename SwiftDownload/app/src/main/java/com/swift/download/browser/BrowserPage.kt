@@ -88,6 +88,8 @@ class BrowserPage(
     private lateinit var bottomToolbar: LinearLayout
     private lateinit var btnBack: TextView
     private lateinit var btnForward: TextView
+    /** v2.8 模块四 4.1：一键抓资源按钮（发现资源时文字高亮） */
+    private lateinit var btnGrab: TextView
 
     /** v2.7 Stage3.2：桌面版 UA 标志（切换后自动刷新当前页） */
     private var desktopMode = false
@@ -280,6 +282,9 @@ class BrowserPage(
         val homeTab = tool("⌂") { goHome() }
         homeTab.setOnLongClickListener { showTabManager(); true }
         bar.addView(homeTab, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        // v2.8 模块四 4.1：一键抓本页磁力/视频资源
+        btnGrab = tool("🎬") { grabPageResources() }
+        bar.addView(btnGrab, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         return bar
     }
 
@@ -360,6 +365,85 @@ class BrowserPage(
             .setNeutralButton("关闭当前") { _, _ -> closeTab(current ?: return@setNeutralButton) }
             .setNegativeButton("取消", null)
             .show()
+    }
+
+    /* ---------------- v2.8 模块四 4.1：一键抓本页资源 ---------------- */
+
+    /**
+     * 抓资源：注入 JS 取渲染后的 DOM（含 <a href>/<input value>/可见文本），
+     * 用纯逻辑 VideoSniff 提取 magnet/.torrent/ed2k/40 位 hash，列表勾选批量下载。
+     */
+    private fun grabPageResources() {
+        val wv = current?.webView
+        if (wv == null || isWebMode().not()) {
+            Ui.toast(context, "请先打开一个网页")
+            return
+        }
+        val js = "(function(){var a=[];" +
+            "document.querySelectorAll('a[href]').forEach(function(e){a.push(e.href)});" +
+            "document.querySelectorAll('input[type=text],textarea').forEach(function(e){if(e.value)a.push(e.value)});" +
+            "a.push(document.body?document.body.innerText:'');" +
+            "return JSON.stringify(a.join('\\n'));})()"
+        try {
+            wv.evaluateJavascript(js) { raw ->
+                val text = try {
+                    org.json.JSONObject("{\"v\":$raw}").getString("v")
+                } catch (e: Exception) { raw ?: "" }
+                val resources = com.swift.download.player.VideoSniff.extractPageResources(text)
+                post {
+                    if (resources.isEmpty()) {
+                        btnGrab.text = "🎬"; Ui.toast(context, "本页未发现可抓取的磁力/种子资源")
+                    } else {
+                        btnGrab.text = "🎬${resources.size}"
+                        showResourcePicker(resources)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Ui.toast(context, "抓取失败：${e.message ?: "未知错误"}")
+        }
+    }
+
+    /** 资源选择弹窗：多选 + 单项点击下载 */
+    private fun showResourcePicker(resources: List<com.swift.download.player.VideoSniff.PageResource>) {
+        val ctx = context
+        val labels = resources.map { r ->
+            val tag = when (r.kind) {
+                com.swift.download.player.VideoSniff.PageResource.Kind.MAGNET -> "磁力"
+                com.swift.download.player.VideoSniff.PageResource.Kind.TORRENT -> "种子"
+                com.swift.download.player.VideoSniff.PageResource.Kind.ED2K -> "电驴"
+            }
+            "[$tag] ${r.title}"
+        }.toTypedArray()
+        val checked = BooleanArray(resources.size) { true }
+        android.app.AlertDialog.Builder(ctx)
+            .setTitle("发现 ${resources.size} 个资源（勾选后批量下载）")
+            .setMultiChoiceItems(labels, checked) { _, which, isChecked -> checked[which] = isChecked }
+            .setPositiveButton("下载选中") { _, _ ->
+                val selected = resources.filterIndexed { i, _ -> checked[i] }
+                if (selected.isEmpty()) { Ui.toast(ctx, "未选择任何资源"); return@setPositiveButton }
+                for (r in selected) startPageResource(r)
+                Ui.toast(ctx, "已提交 ${selected.size} 个任务")
+            }
+            .setNeutralButton("全部复制") { _, _ ->
+                val text = resources.joinToString("\n") { it.uri }
+                val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("resources", text))
+                Ui.toast(ctx, "已复制 ${resources.size} 条链接")
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** 单条资源下载分发 */
+    private fun startPageResource(r: com.swift.download.player.VideoSniff.PageResource) {
+        when (r.kind) {
+            com.swift.download.player.VideoSniff.PageResource.Kind.MAGNET -> onNewMagnet(r.uri)
+            com.swift.download.player.VideoSniff.PageResource.Kind.TORRENT ->
+                onTorrentLink(r.uri, current?.url.orEmpty(), cookieFor(r.uri))
+            com.swift.download.player.VideoSniff.PageResource.Kind.ED2K ->
+                Ui.toast(context, "电驴链接暂不支持直接下载，请用「全部复制」")
+        }
     }
 
     /* ---------------- 标签管理 ---------------- */

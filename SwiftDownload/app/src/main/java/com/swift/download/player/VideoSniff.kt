@@ -71,4 +71,84 @@ object VideoSniff {
         }
         return decoded.ifBlank { "视频" }
     }
+
+    /* ---------------- v2.8 模块四 4.1：DOM 批量资源提取 ---------------- */
+
+    /** 一键抓取到的资源项 */
+    data class PageResource(
+        val uri: String,        // 可直接下载：magnet: / http(s) .torrent / ed2k:
+        val kind: Kind,
+        val title: String,      // 结合附近标题
+        val hash: String = ""   // 40 位 infohash（hash 类资源）
+    ) {
+        enum class Kind { MAGNET, TORRENT, ED2K }
+    }
+
+    private val hash40Regex = Regex("""\b[0-9a-fA-F]{40}\b""")
+    private val ed2kRegex = Regex("""ed2k://\|file\|[^|\s]+\|\d+\|[0-9a-fA-F]{32}\|/?""", RegexOption.IGNORE_CASE)
+
+    /**
+     * 从页面可见文本/HTML 批量提取磁力资源。
+     * 覆盖：完整 magnet 链接、.torrent 直链、ed2k、40 位裸 infohash；
+     * 按 uri 去重，标题优先取链接<a>文本或 dn= 参数，其次取附近文本。
+     */
+    fun extractPageResources(rawHtml: String): List<PageResource> {
+        // 去 script/style 避免干扰，但保留 <a> 文本用于标题
+        val html = rawHtml
+            .replace(Regex("""<script[\s\S]*?</script>""", RegexOption.IGNORE_CASE), " ")
+            .replace(Regex("""<style[\s\S]*?</style>""", RegexOption.IGNORE_CASE), " ")
+        val out = LinkedHashMap<String, PageResource>()
+
+        // 1. 完整 magnet 链接（含 btih 后的 dn= 作标题）
+        val magnetRegex = Regex("""magnet:\?xt=urn:btih:[0-9a-zA-Z]{32,40}[^\s<>"']*""", RegexOption.IGNORE_CASE)
+        for (m in magnetRegex.findAll(html)) {
+            val uri = m.value.trimEnd('&', '"', '\'')
+            val hash = Regex("""btih:([0-9a-zA-Z]{32,40})""", RegexOption.IGNORE_CASE)
+                .find(uri)?.groupValues?.get(1)?.lowercase().orEmpty()
+            val dn = Regex("""[?&]dn=([^&"'\s<]+)""", RegexOption.IGNORE_CASE)
+                .find(uri)?.groupValues?.get(1)?.let { decode(it) }
+            out.putIfAbsent(uri, PageResource(uri, PageResource.Kind.MAGNET,
+                dn?.ifBlank { null } ?: nearbyTitle(html, m.range.first), hash))
+        }
+
+        // 2. .torrent 直链（http(s)）
+        val torrentRegex = Regex("""https?://[^\s<>"']+\.torrent(?:\?[^\s<>"']*)?""", RegexOption.IGNORE_CASE)
+        for (m in torrentRegex.findAll(html)) {
+            val uri = m.value
+            out.putIfAbsent(uri, PageResource(uri, PageResource.Kind.TORRENT, nearbyTitle(html, m.range.first)))
+        }
+
+        // 3. ed2k
+        for (m in ed2kRegex.findAll(html)) {
+            val uri = m.value
+            val name = Regex("""ed2k://\|file\|([^|\s]+)""").find(uri)?.groupValues?.get(1)?.let { decode(it) }
+            out.putIfAbsent(uri, PageResource(uri, PageResource.Kind.ED2K, name ?: "ed2k 资源"))
+        }
+
+        // 4. 40 位裸 hash → 组装 magnet（排除已被完整 magnet 覆盖的）
+        for (m in hash40Regex.findAll(html)) {
+            val hash = m.value.lowercase()
+            val uri = "magnet:?xt=urn:btih:$hash"
+            if (out.containsKey(uri)) continue
+            // 若该 hash 出现在已记录的 magnet 里，跳过
+            if (out.values.any { it.hash.equals(hash, ignoreCase = true) }) continue
+            out.putIfAbsent(uri, PageResource(uri, PageResource.Kind.MAGNET, nearbyTitle(html, m.range.first), hash))
+        }
+        return out.values.toList()
+    }
+
+    private fun decode(s: String): String = try {
+        java.net.URLDecoder.decode(s, "UTF-8")
+    } catch (e: Exception) { s }
+
+    /** 取链接附近可见文本作标题（去标签） */
+    private fun nearbyTitle(html: String, pos: Int): String {
+        val from = maxOf(0, pos - 120)
+        val to = minOf(html.length, pos + 160)
+        val window = html.substring(from, to)
+        val texts = Regex(""">([^<>]{2,60})<""").findAll(window)
+            .map { it.groupValues[1].trim() }
+            .filter { it.isNotBlank() && !it.startsWith("http") && !it.startsWith("magnet") }
+        return texts.firstOrNull() ?: "未命名资源"
+    }
 }

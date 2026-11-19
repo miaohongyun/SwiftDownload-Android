@@ -40,10 +40,25 @@ object MagnetSearch {
         )
     }
 
+    /** v2.8 模块四：单个源的诊断状态 */
+    enum class SourceStatus { OK, EMPTY_SHELL, HTTP_403, TIMEOUT, NETWORK, PARSE }
+
+    /** v2.8 模块四：单源搜索结果明细（供状态栏展开展示） */
+    data class SourceOutcome(
+        val sourceId: String,
+        val status: SourceStatus,
+        val count: Int = 0,
+        val detail: String = ""
+    )
+
+    /** 网络层异常：携带 HTTP 状态码，供诊断区分 403/超时 */
+    class FetchException(val statusCode: Int, message: String) : Exception(message)
+
     data class SearchReport(
         val results: List<Result>,
         val okSources: List<String>,     // 成功返回结果的源
-        val failedSources: List<String>  // 网络/解析失败的源（自动跳过）
+        val failedSources: List<String>,  // 网络/解析失败的源（自动跳过）
+        val outcomes: List<SourceOutcome> = emptyList()  // v2.8：每源明细
     )
 
     /** 聚合核心（纯函数）：输入 = 源 → 该源抓到的原始条目列表 */
@@ -109,7 +124,7 @@ object MagnetSearch {
         timeoutSecs: Int = 10
     ): SearchReport {
         if (keyword.isBlank() || sources.isEmpty()) return SearchReport(emptyList(), emptyList(), emptyList())
-        val futures = HashMap<String, Future<List<MagnetParsers.RawItem>>>()
+        val futures = LinkedHashMap<String, Future<List<MagnetParsers.RawItem>>>()
         for (s in sources) {
             futures[s.id] = pool.submit(Callable {
                 val html = fetcher.fetch(s.urlFor(keyword))
@@ -119,17 +134,79 @@ object MagnetSearch {
         val rawBySource = LinkedHashMap<String, List<MagnetParsers.RawItem>>()
         val ok = ArrayList<String>()
         val failed = ArrayList<String>()
+        val outcomes = ArrayList<SourceOutcome>()
         for ((id, fut) in futures) {
             try {
                 val items = fut.get(timeoutSecs.toLong(), TimeUnit.SECONDS)
                 rawBySource[id] = items
                 ok.add(id)
+                // v2.8：成功但 0 条 → 空壳页（JS 渲染/反爬），供 UI 提示走离屏抓取兜底
+                outcomes.add(SourceOutcome(id, if (items.isEmpty()) SourceStatus.EMPTY_SHELL else SourceStatus.OK,
+                    items.size))
             } catch (e: Exception) {
                 fut.cancel(true) // 超时后中断抓取线程，避免失效源长期占用线程池
                 failed.add(id) // 失效源自动跳过
+                outcomes.add(SourceOutcome(id, classifyFailure(e), 0, e.message ?: ""))
             }
         }
-        return SearchReport(aggregate(rawBySource), ok, failed)
+        return SearchReport(aggregate(rawBySource), ok, failed, outcomes)
+    }
+
+    /**
+     * v2.8：合并主搜索报告与离屏 WebView 兜底抓到的结果（纯函数，可单测）。
+     * 按 hash 去重，来源/做种/体积取并集与最大值。
+     */
+    fun mergeFallback(base: SearchReport, fallbackRaw: Map<String, List<MagnetParsers.RawItem>>): SearchReport {
+        if (fallbackRaw.isEmpty()) return base
+        val extra = aggregate(fallbackRaw)
+        if (extra.isEmpty()) return base
+        val byHash = LinkedHashMap<String, Result>()
+        for (r in base.results) byHash[r.hash] = r
+        var added = 0
+        for (r in extra) {
+            val old = byHash[r.hash]
+            if (old == null) {
+                byHash[r.hash] = r
+                added++
+            } else {
+                byHash[r.hash] = old.copy(
+                    sources = (old.sources + r.sources).distinct().sorted(),
+                    seeders = maxOf(old.seeders, r.seeders),
+                    sizeBytes = maxOf(old.sizeBytes, r.sizeBytes)
+                )
+            }
+        }
+        val newOutcomes = base.outcomes.toMutableList()
+        for ((id, items) in fallbackRaw) {
+            val idx = newOutcomes.indexOfFirst { it.sourceId == id }
+            if (items.isNotEmpty()) {
+                val upd = SourceOutcome(id, SourceStatus.OK, items.size, "离屏抓取")
+                if (idx >= 0) newOutcomes[idx] = upd else newOutcomes.add(upd)
+            }
+        }
+        val newOk = base.okSources.toMutableList()
+        for (id in fallbackRaw.keys) if (id !in newOk) newOk.add(id)
+        return SearchReport(
+            results = byHash.values.toList(),
+            okSources = newOk,
+            failedSources = base.failedSources.filter { it !in fallbackRaw.keys },
+            outcomes = newOutcomes
+        )
+    }
+
+    /** 异常 → 诊断状态（纯函数，可单测） */
+    fun classifyFailure(t: Throwable): SourceStatus {
+        var e: Throwable? = t
+        while (e != null) {
+            when (e) {
+                is java.util.concurrent.TimeoutException -> return SourceStatus.TIMEOUT
+                is java.net.SocketTimeoutException -> return SourceStatus.TIMEOUT
+                is FetchException -> return if (e.statusCode == 401 || e.statusCode == 403)
+                    SourceStatus.HTTP_403 else SourceStatus.NETWORK
+            }
+            e = e.cause
+        }
+        return SourceStatus.NETWORK
     }
 
     /** 默认 HttpURLConnection 抓取（桌面 UA + gzip 支持 + 编码探测） */
@@ -144,6 +221,9 @@ object MagnetSearch {
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"
             )
             conn.setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9")
+            // v2.8：显式检查状态码，403/401 报给诊断层，不再笼统当"网络失败"
+            val code = conn.responseCode
+            if (code >= 400) throw FetchException(code, "HTTP $code")
             val enc = conn.contentEncoding ?: ""
             val stream = if (enc.contains("gzip")) {
                 java.util.zip.GZIPInputStream(conn.inputStream)
