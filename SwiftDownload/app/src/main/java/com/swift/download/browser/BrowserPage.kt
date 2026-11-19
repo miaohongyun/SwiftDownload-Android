@@ -74,6 +74,16 @@ class BrowserPage(
     /** v2.7 Stage3.2：桌面版 UA 标志（切换后自动刷新当前页） */
     private var desktopMode = false
 
+    /**
+     * v2.7 真机修复：以下属性必须声明在 init 块之前。
+     * Kotlin 按源码顺序初始化属性；若写在 init 之后，init 里对 sniffBadge 的赋值
+     * 会被随后的 `= null` 覆盖（角标永远不显示），其它 init 期访问的属性则会 NPE。
+     */
+    /** 嗅探结果角标（数量 = 当前标签去重后的视频链接数） */
+    private var sniffBadge: TextView? = null
+    /** 视频嗅探：同一页面只提示一次，避免分片请求反复弹窗 */
+    private var sniffKey: String? = null
+
     private val siteStore = QuickSites.get(context)
     /** v2.7 Stage3.1：广告拦截开关与自定义规则（与设置页共享同一单例） */
     private val settings = DownloadSettings.get(context)
@@ -176,9 +186,6 @@ class BrowserPage(
     fun onHostPause() { tabs.mapNotNull { it.webView }.forEach { it.onPause() } }
     fun onHostResume() { tabs.mapNotNull { it.webView }.forEach { it.onResume() } }
     fun onHostDestroy() { tabs.mapNotNull { it.webView }.forEach { it.destroy() } }
-
-    /** v2.6.0：嗅探结果角标（数量 = 当前标签去重后的视频链接数） */
-    private var sniffBadge: TextView? = null
 
     private fun refreshSniffBadge() {
         val b = sniffBadge ?: return
@@ -358,9 +365,6 @@ class BrowserPage(
             } else false
         }
     }
-
-    /** 视频嗅探：同一页面只提示一次，避免分片请求反复弹窗 */
-    private var sniffKey: String? = null
 
     private fun client(t: Tab) = object : WebViewClient() {
         /** 页面加载的任意子资源都经过这里；命中 m3u8/mp4 即提示用户，不拦截不影响播放 */

@@ -335,3 +335,40 @@ MainActivity（四页主壳 / Intent 接管 / 浮层 / 投屏与边播接线）
   解析与封装决策、AdBlocker 规则/scheme、多链接提取分类、Zip Slip 防护、备份 JSON 往返与版本校验、
   状态筛选计数。
 - `BackupCodec` 的纯 Kotlin 实现是"零重型依赖 + 可单测"约束的直接结果；所有新增纯逻辑模块均有 JVM 单测。
+
+---
+
+## 开发铁律（2026-11-19 真机闪退复盘后新增）
+
+### 铁律一：类成员属性必须全部声明在 `init {}` 块之前
+
+适用于所有继承 `View` / `FrameLayout` / `LinearLayout` 的页面类
+（`TransfersPage`、`BrowserPage`、`FilesPage`、`MagnetSearchPage`、`DownloadSettingsPage` 等）。
+
+**规则**：所有 `private val/var` 属性（含默认值、`adapter`、集合、监听器、缓存、角标引用）
+必须写在 `init {}` 块的上方，**绝不允许**把任何属性声明放到 `init {}` 之后。
+
+**为什么**：Kotlin 按源码出现顺序执行属性初始化与 init 块。若某属性声明在 init 之后，
+而 init 执行期间就访问它，它此刻仍是 `null`。传给非空参数会触发
+`checkNotNullParameter` → `NullPointerException` → Activity 启动崩溃；
+若只是 `var = 默认值` 且 init 里曾赋值，则该赋值随后被默认值覆盖，变成静默逻辑 bug。
+
+**真实事故**：v2.7 Stage4.2 把 `lastTasks = emptyList()` 写在 `TransfersPage.init` 之后，
+init 里构建筛选胶囊时 `labelOf()` → `TaskFilters.counts(lastTasks)` 读到 null，
+小米14pro 首次启动点完通知权限即闪退。此类问题编译期、lint、JVM 单测均无法发现，
+只有真机实例化页面时才暴露。同步修复的同类隐患：`BrowserPage.sniffBadge`（角标被 null 覆盖）、
+`TransfersPage` 的 `lastBytes/lastTs/serverSpeeds/ignoredClipboardUrl`。
+
+**自动守卫**：`SourceLayoutGuardTest`（纯 JVM 文本扫描，无 Robolectric 依赖）会在每次
+`testDebugUnitTest` 时扫描所有含 init 块的类，发现 init 之后的类成员属性即 fail。
+新增页面类务必遵守，守卫测试是最后一道防线。
+
+### 铁律二：页面结构问题用最小成本自动化堵住，不引入重型测试框架
+
+- 纯逻辑/结构问题（如属性初始化顺序、init 访问时序）优先用 JVM 单测 + 源码扫描覆盖，
+  保持"零重型依赖"（不引入 Robolectric/Room/Compose 等）。
+- 需要真机验证的启动冒烟（如 MainActivity 首次安装启动不崩），
+  在怀疑阶段可用临时 `UncaughtExceptionHandler` + 崩溃展示页（`CrashReport`/`CrashActivity`）
+  直接把堆栈显示在屏幕上，无需 adb；定位完成后移除诊断代码。
+- 任何改动页面类构造函数/init 块的行为，必须真机全新安装（非覆盖升级）验证一次启动流程，
+  因为全新安装才会走 `onCreate` + 属性初始化的完整时序。

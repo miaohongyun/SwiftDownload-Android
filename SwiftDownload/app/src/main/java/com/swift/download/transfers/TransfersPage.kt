@@ -96,10 +96,27 @@ class TransfersPage(
     private var currentFilter = TaskFilters.Filter.ALL
     private val filterPills = ArrayList<TextView>()
 
+    /**
+     * 任务列表缓存。必须声明在 init 块之前 —— init 里构建筛选胶囊时会调用
+     * labelOf() → TaskFilters.counts(lastTasks)，若此时 lastTasks 尚未初始化则为 null，
+     * 传给非空参数 tasks 会直接 NPE 导致 Activity 启动崩溃（真机实测踩坑）。
+     */
+    private var lastTasks: List<DownloadTask> = emptyList()
+
     private val speedHints = HashMap<Long, Long>()
 
     /** v2.5：单任务限速值缓存（供弹窗回显与按钮标记） */
     private val taskLimits = HashMap<Long, Long>()
+
+    /** 速度差分采样（init 末尾的 onTasks 会经 computeSpeeds 访问，必须在 init 之前初始化） */
+    private val lastBytes = HashMap<Long, Long>()
+    private val lastTs = HashMap<Long, Long>()
+    private val serverSpeeds = HashMap<Long, Long>()
+
+    /** 剪贴板忽略记录 */
+    private var ignoredClipboardUrl: String? = null
+
+    private val lastTasksRef get() = lastTasks
 
     init {
         setBackgroundColor(Ui.BG)
@@ -162,10 +179,6 @@ class TransfersPage(
      * v2.5：速度优先取服务端采样值（1 秒窗口差分）。
      * 本地差分自算仅作为服务端未提供时的兜底 —— 否则任务刚启动时首帧恒为 0 B/s。
      */
-    private val lastBytes = HashMap<Long, Long>()
-    private val lastTs = HashMap<Long, Long>()
-    private val serverSpeeds = HashMap<Long, Long>()
-
     private fun computeSpeeds(tasks: List<DownloadTask>) {
         val now = System.currentTimeMillis()
         val live = tasks.filter { it.status == DownloadTask.Status.RUNNING }
@@ -260,8 +273,6 @@ class TransfersPage(
 
     /* ---------------- 剪贴板检测卡（v1.0） ---------------- */
 
-    private var ignoredClipboardUrl: String? = null
-
     /** v2.6.0：从整段分享文案中提取直链/磁力（获焦时由宿主调用） */
     fun checkClipboard() {
         try {
@@ -275,9 +286,6 @@ class TransfersPage(
             // 忽略
         }
     }
-
-    private var lastTasks: List<DownloadTask> = emptyList()
-    private val lastTasksRef get() = lastTasks
 
     /* ---------------- 对话框 ---------------- */
 
