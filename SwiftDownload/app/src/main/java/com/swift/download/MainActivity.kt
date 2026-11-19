@@ -30,6 +30,7 @@ import com.swift.download.magnet.MagnetSourceManagerPage
 import com.swift.download.settings.DownloadSettings
 import com.swift.download.settings.DownloadSettingsPage
 import com.swift.download.transfers.TransfersPage
+import com.swift.download.ui.NavIconView
 import com.swift.download.ui.Ui
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -341,7 +342,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private val navTabs = ArrayList<TextView>()
-    private val navIcons = ArrayList<TextView>()
+    private val navIcons = ArrayList<NavIconView>()
+    /** 无障碍勘误后：tab 容器仅承载 isSelected 选中态，不设 contentDescription */
+    private val navTabViews = ArrayList<View>()
 
     private fun buildBottomNav(): View {
         val ctx = this
@@ -352,22 +355,25 @@ class MainActivity : AppCompatActivity() {
             elevation = Ui.dp(ctx, 6f).toFloat()
             setPadding(0, Ui.dp(ctx, 6f), 0, Ui.dp(ctx, 6f))
         }
+        // 单色几何图标（NavIconView）替代彩色 emoji，激活态可 tint
         val items = listOf(
-            Triple("浏览器", "🌐", 0),
-            Triple("传输", "⇅", 1),
-            Triple("文件", "📁", 2),
-            Triple("我的", "👤", 3)
+            Triple("浏览器", 0, 0),
+            Triple("传输", 1, 1),
+            Triple("文件", 2, 2),
+            Triple("我的", 3, 3)
         )
         for ((label, icon, idx) in items) {
             val tab = LinearLayout(ctx).apply {
                 orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER
                 setPadding(0, Ui.dp(ctx, 2f), 0, Ui.dp(ctx, 2f))
+                // 无障碍：图标为装饰性（旁边有可见文字标签负责朗读），不设 contentDescription，
+                // 否则 TalkBack 会把"传输，第2/4页"+可见"传输"读两遍
                 setOnClickListener { switchTo(idx) }
             }
-            val ic = TextView(ctx).apply {
-                text = icon; textSize = 18f; gravity = Gravity.CENTER
-                setPadding(Ui.dp(ctx, 12f), Ui.dp(ctx, 4f), Ui.dp(ctx, 12f), Ui.dp(ctx, 4f))
+            val ic = NavIconView(ctx, icon, 24f).apply {
+                setPadding(Ui.dp(ctx, 8f), Ui.dp(ctx, 3f), Ui.dp(ctx, 8f), Ui.dp(ctx, 3f))
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             }
             val tv = TextView(ctx).apply {
                 text = label; textSize = 11f; setTextColor(Ui.TXT_SUB)
@@ -378,6 +384,7 @@ class MainActivity : AppCompatActivity() {
             nav.addView(tab, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             navTabs.add(tv)
             navIcons.add(ic)
+            navTabViews.add(tab)
         }
         return nav
     }
@@ -388,11 +395,12 @@ class MainActivity : AppCompatActivity() {
             tv.setTextColor(if (active) Ui.BLUE else Ui.TXT_SUB)
             tv.typeface = if (active) android.graphics.Typeface.DEFAULT_BOLD else android.graphics.Typeface.DEFAULT
             navIcons.getOrNull(i)?.apply {
-                setTextColor(if (active) Ui.BLUE else Ui.TXT_SUB)
+                setTint(if (active) Ui.BLUE else Ui.TEXT_DISABLED)
                 background = if (active) android.graphics.drawable.GradientDrawable().apply {
                     setColor(Ui.BLUE_LIGHT); cornerRadius = Ui.dp(this@MainActivity, 14f).toFloat()
                 } else null
             }
+            navTabViews.getOrNull(i)?.isSelected = active
         }
     }
 
@@ -669,9 +677,11 @@ class MainActivity : AppCompatActivity() {
 
     override fun onBackPressed() {
         if (overlay != null) { closeOverlay(); return }
-        if (currentPage == 0) {
-            val wv = browserPage.currentWebView()
-            if (wv?.canGoBack() == true) { wv.goBack(); return }
+        if (currentPage == 0 && browserPage.isInWebMode() &&
+            browserPage.currentWebView()?.canGoBack() == true
+        ) {
+            browserPage.currentWebView()?.goBack()
+            return
         }
         // v2.2：双击返回退出（防误触）
         val now = android.os.SystemClock.elapsedRealtime()
@@ -779,8 +789,15 @@ class MainActivity : AppCompatActivity() {
         override fun pauseAll() { binder?.pauseAll() }
         override fun resumeAll() { binder?.resumeAll() }
         override fun clearCompleted() {
-            binder?.clearCompleted()
-            Ui.toast(this@MainActivity, "已清除完成记录（文件保留）")
+            android.app.AlertDialog.Builder(this@MainActivity)
+                .setTitle("清除完成记录")
+                .setMessage("清除所有已完成任务？（不会删除文件）")
+                .setPositiveButton("清除记录") { _, _ ->
+                    binder?.clearCompleted()
+                    Ui.toast(this@MainActivity, "已清除完成记录（文件保留）")
+                }
+                .setNegativeButton("取消", null)
+                .show()
         }
         override fun refreshLink(id: Long, newUrl: String): Boolean =
             binder?.refreshLink(id, newUrl) == true

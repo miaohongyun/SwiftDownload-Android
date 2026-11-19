@@ -68,10 +68,18 @@ class MagnetSourceManagerPage(context: Context) : FrameLayout(context) {
             gravity = Gravity.CENTER
             setPadding(0, Ui.dp(context, 14f), 0, Ui.dp(context, 14f))
             setOnClickListener {
-                store.resetAll()
-                testResults.clear()
-                rebuild()
-                Ui.toast(context, "已恢复默认")
+                val customCount = store.customSources().size
+                AlertDialog.Builder(context)
+                    .setTitle("恢复默认源配置")
+                    .setMessage("恢复默认？将清除 $customCount 个自定义源。")
+                    .setPositiveButton("恢复默认") { _, _ ->
+                        store.resetAll()
+                        testResults.clear()
+                        rebuild()
+                        Ui.toast(context, "已恢复默认")
+                    }
+                    .setNegativeButton("取消", null)
+                    .show()
             }
         }
         root.addView(reset, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
@@ -144,10 +152,17 @@ class MagnetSourceManagerPage(context: Context) : FrameLayout(context) {
                     "修改名称 / 解析规则" -> showEditCustomDialog(ctx, src)
                     "测试连通性" -> testOne(src)
                     "删除此源" -> {
-                        store.removeCustom(src.id)
-                        testResults.remove(src.id)
-                        rebuild()
-                        Ui.toast(ctx, "已删除「${src.name}」")
+                        AlertDialog.Builder(ctx)
+                            .setTitle("删除磁力源")
+                            .setMessage("删除磁力源「${src.name}」？")
+                            .setPositiveButton("删除") { _, _ ->
+                                store.removeCustom(src.id)
+                                testResults.remove(src.id)
+                                rebuild()
+                                Ui.toast(ctx, "已删除「${src.name}」")
+                            }
+                            .setNegativeButton("取消", null)
+                            .show()
                     }
                 }
             }

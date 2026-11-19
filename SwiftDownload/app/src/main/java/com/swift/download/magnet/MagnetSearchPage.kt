@@ -37,10 +37,14 @@ class MagnetSearchPage(
     private val etKeyword: EditText
     private val tvStatus: TextView
     private val rv: RecyclerView
+    /** 0 结果时显示空状态并与结果列表互斥 */
+    private val emptyView: View
     private val detailPanel: LinearLayout
     private val adapter = ResultAdapter()
     private var lastReport: MagnetSearch.SearchReport? = null
     private var detailExpanded = false
+    /** 搜索进行中：清空旧结果时不显示「未找到资源」，避免加载态误报空 */
+    private var searching = false
 
     init {
         setBackgroundColor(Ui.BG)
@@ -83,12 +87,31 @@ class MagnetSearchPage(
         header.addView(detailPanel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         rv = Ui.recyclerView(context)
         rv.adapter = adapter
+        emptyView = Ui.emptyState(
+            context, "搜", "未找到资源",
+            "换个关键词，或到「磁力源管理」检查源状态",
+            "换关键词",
+            onAction = {
+                // 真实状态转移：聚焦关键词输入框并唤起键盘，用户可直接改词重搜
+                etKeyword.requestFocus()
+                etKeyword.post {
+                    val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE)
+                        as? android.view.inputmethod.InputMethodManager
+                    imm?.showSoftInput(
+                        etKeyword,
+                        android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT
+                    )
+                }
+            }
+        )
+        emptyView.visibility = View.GONE
 
         val root = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
         root.addView(header, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
             setMargins(Ui.dp(context, 12f), Ui.dp(context, 10f), Ui.dp(context, 12f), 0)
         })
         root.addView(rv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        root.addView(emptyView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         addView(root, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
     }
 
@@ -101,6 +124,7 @@ class MagnetSearchPage(
         val kw = etKeyword.text.toString().trim()
         if (kw.isEmpty()) { Ui.toast(context, "请输入关键词"); return }
         tvStatus.text = "正在聚合搜索“$kw”…"
+        searching = true
         adapter.submit(emptyList())
         val sources = store.enabled()
         scope.launch {
@@ -122,6 +146,7 @@ class MagnetSearchPage(
                 MagnetSearch.mergeFallback(first, fallbackRaw)
             }
             lastReport = report
+            searching = false
             adapter.submit(report.results)
             tvStatus.text = buildString {
                 append("找到 ${report.results.size} 条")
@@ -162,6 +187,9 @@ class MagnetSearchPage(
         fun submit(list: List<MagnetSearch.Result>) {
             items.clear(); items.addAll(list)
             notifyDataSetChanged()
+            val empty = list.isEmpty() && !searching
+            rv.visibility = if (empty) View.GONE else View.VISIBLE
+            emptyView.visibility = if (empty) View.VISIBLE else View.GONE
         }
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ResultVh {
             val v = buildRow(parent.context)

@@ -125,6 +125,7 @@ class BrowserPage(
             max = 100
             visibility = GONE
             progressTintList = android.content.res.ColorStateList.valueOf(Ui.BLUE)
+            progressBackgroundTintList = android.content.res.ColorStateList.valueOf(Ui.BORDER)
         }
         root.addView(progress, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(context, 3f)))
 
@@ -241,27 +242,29 @@ class BrowserPage(
             setBackgroundColor(Ui.CARD)
             setPadding(Ui.dp(ctx, 8f), Ui.dp(ctx, 8f), Ui.dp(ctx, 8f), Ui.dp(ctx, 8f))
         }
-        fun tool(glyph: String, act: () -> Unit): TextView = TextView(ctx).apply {
+        /** 单色符号统一 tint，彩色 emoji「🎬」改为文字「抓」；每个键带无障碍描述 */
+        fun tool(glyph: String, desc: String, act: () -> Unit): TextView = TextView(ctx).apply {
             text = glyph; textSize = 20f; gravity = Gravity.CENTER
+            contentDescription = desc
             setTextColor(Ui.BLUE)
             setPadding(Ui.dp(ctx, 12f), Ui.dp(ctx, 10f), Ui.dp(ctx, 12f), Ui.dp(ctx, 10f))
             Ui.pressable(this)
             setOnClickListener { act() }
         }
-        btnBack = tool("←") { current?.webView?.goBack() }
-        btnForward = tool("→") { current?.webView?.goForward() }
+        btnBack = tool("←", "后退") { current?.webView?.goBack() }
+        btnForward = tool("→", "前进") { current?.webView?.goForward() }
         bar.addView(btnBack, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         bar.addView(btnForward, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        bar.addView(tool("↻") { current?.webView?.reload() },
+        bar.addView(tool("↻", "刷新") { current?.webView?.reload() },
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        bar.addView(tool("☆") { bookmarkCurrentPage() },
+        bar.addView(tool("☆", "添加书签") { bookmarkCurrentPage() },
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         // 第5键：单击回首页，长按弹出多标签管理
-        val homeTab = tool("⌂") { goHome() }
+        val homeTab = tool("⌂", "首页") { goHome() }
         homeTab.setOnLongClickListener { showTabManager(); true }
         bar.addView(homeTab, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         // v2.8 模块四 4.1：一键抓本页磁力/视频资源
-        btnGrab = tool("🎬") { grabPageResources() }
+        btnGrab = tool("抓", "抓资源") { grabPageResources() }
         bar.addView(btnGrab, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         return bar
     }
@@ -325,7 +328,7 @@ class BrowserPage(
     private fun refreshNavButtons() {
         val wv = current?.webView
         fun dim(tv: TextView, enabled: Boolean) {
-            tv.setTextColor(if (enabled) Ui.BLUE else 0xFFC9CED8.toInt())
+            tv.setTextColor(if (enabled) Ui.BLUE else Ui.TEXT_DISABLED)
             tv.isEnabled = enabled
         }
         dim(btnBack, wv?.canGoBack() == true)
@@ -428,6 +431,9 @@ class BrowserPage(
 
     /** 宿主（返回键）需要：当前标签的 WebView */
     fun currentWebView(): WebView? = current?.webView
+
+    /** 宿主（返回键）需要：是否处于网页态；复用内部判定，避免两处逻辑漂移 */
+    fun isInWebMode(): Boolean = isWebMode()
 
     /* v2.6.0：宿主生命周期转发，防止退出后网页后台音视频仍在播放 */
     fun onHostPause() { tabs.mapNotNull { it.webView }.forEach { it.onPause() } }
@@ -1043,6 +1049,15 @@ class BrowserPage(
 
     private fun goHome() {
         val t = current ?: return
+        // v2.8 交互修复：回首页必须连带清掉 WebView 历史，否则首页按系统返回键会跳回旧网页。
+        // 先载 about:blank 再清历史，确保 about:blank 成为唯一条目且 canGoBack()==false。
+        t.webView?.let { wv ->
+            try {
+                wv.stopLoading()
+                wv.loadUrl("about:blank")
+                wv.clearHistory()
+            } catch (_: Exception) { /* WebView 已销毁时不阻断回首页 */ }
+        }
         // v2.5.2：只把首页设为 VISIBLE 是不够的 —— 当前标签的 WebView 仍盖在上面，
         // 表现就是"点主页没反应，还是旧页面"
         for (tab in tabs) tab.webView?.visibility = GONE

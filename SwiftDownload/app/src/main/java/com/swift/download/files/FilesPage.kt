@@ -44,6 +44,9 @@ class FilesPage(
     private val extraRoots: List<File> =
         listOf(StorageRoots.publicDownloads()).filter { it.absolutePath != rootDir.absolutePath }
     private val adapter = FileAdapter()
+    /** 空状态与列表互斥：有文件时显示 rv，无文件时显示 emptyView */
+    private val rv: RecyclerView
+    private val emptyView: View
     private val tvPath: TextView
     private val tvSort: TextView
     private var sortMode = FileSorts.Mode.TIME_DESC
@@ -70,9 +73,12 @@ class FilesPage(
             setMargins(Ui.dp(context, 14f), 0, Ui.dp(context, 14f), Ui.dp(context, 4f))
         })
 
-        val rv = Ui.recyclerView(context)
+        rv = Ui.recyclerView(context)
         rv.adapter = adapter
         root.addView(rv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        emptyView = Ui.emptyState(context, "件", "还没有文件", "下载完成的文件会出现在这里")
+        emptyView.visibility = View.GONE
+        root.addView(emptyView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         addView(root, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
     }
 
@@ -96,6 +102,9 @@ class FilesPage(
             post {
                 if (seq != refreshSeq) return@post
                 adapter.submit(sorted)
+                val empty = sorted.isEmpty()
+                rv.visibility = if (empty) View.GONE else View.VISIBLE
+                emptyView.visibility = if (empty) View.VISIBLE else View.GONE
                 tvSort.text = "排序 · ${sortMode.label} ▾"
                 tvPath.text = "下载目录及子目录 · ${sorted.size} 个文件 · 合计 ${Format.bytes(total)}"
             }

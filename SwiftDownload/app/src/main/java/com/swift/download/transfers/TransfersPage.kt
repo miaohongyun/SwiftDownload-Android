@@ -90,6 +90,9 @@ class TransfersPage(
         fun btDiagnostics(id: Long): com.swift.download.BtDiag? = null
     }
 
+    /** 空任务时隐藏 RecyclerView，改显统一空状态（二者互斥） */
+    private val rv: RecyclerView
+    private val emptyView: View
     private var threadsPref = 4
     private val tvTotal: TextView
     private lateinit var tvFreeSpace: TextView
@@ -183,9 +186,17 @@ class TransfersPage(
         }
         root.addView(filterBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        val rv = Ui.recyclerView(context)
+        rv = Ui.recyclerView(context)
         rv.adapter = adapter
         root.addView(rv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        emptyView = Ui.emptyState(
+            context, "⇅", "还没有下载任务",
+            "点「＋新建」粘贴链接，或复制磁力链接自动识别",
+            "＋新建任务",
+            onAction = { showNewTaskDialog() }
+        )
+        emptyView.visibility = View.GONE
+        root.addView(emptyView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         addView(root, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         onTasks(emptyList())
     }
@@ -248,14 +259,12 @@ class TransfersPage(
         for ((i, pill) in filterPills.withIndex()) {
             val f = TaskFilters.Filter.entries[i]
             pill.text = labelOf(f)
-            // 选中态用实心，未选中描边
-            val color = Ui.BLUE
+            // 选中：BLUE 底白字；未选中：SURFACE_MUTED 底 + TXT_SUB 字 + 无描边
             pill.background = android.graphics.drawable.GradientDrawable().apply {
-                setColor(if (f == currentFilter) color else 0x00000000)
-                setStroke(Ui.dp(context, 1f), color)
+                setColor(if (f == currentFilter) Ui.BLUE else Ui.SURFACE_MUTED)
                 cornerRadius = Ui.dp(context, 16f).toFloat()
             }
-            pill.setTextColor(if (f == currentFilter) 0xFFFFFFFF.toInt() else color)
+            pill.setTextColor(if (f == currentFilter) 0xFFFFFFFF.toInt() else Ui.TXT_SUB)
         }
     }
 
@@ -278,10 +287,13 @@ class TransfersPage(
         refreshFilterPills()
         // v2.7 Stage4.2：按当前筛选条件展示任务（剪贴板卡/新建卡始终在最上方保留）
         val shown = TaskFilters.filter(tasks, currentFilter)
+        // 内容为空 = 无任务且无剪贴板识别卡；此时显示统一空状态并隐藏列表
+        val hasContent = shown.isNotEmpty() || adapter.pendingClipUrl != null
+        rv.visibility = if (hasContent) View.VISIBLE else View.GONE
+        emptyView.visibility = if (hasContent) View.GONE else View.VISIBLE
         adapter.submit(buildList {
             adapter.pendingClipUrl?.let { add(Decor.ClipCard(it)) }
             add(Decor.NewTaskCard)
-            if (shown.isEmpty()) add(Decor.EmptyState)
             for (t in shown) add(Decor.DecorTask(t))
         })
     }
@@ -499,7 +511,6 @@ class TransfersPage(
     sealed interface Decor {
         data object NewTaskCard : Decor
         data class ClipCard(val url: String) : Decor
-        data object EmptyState : Decor
         data class DecorTask(val task: DownloadTask) : Decor
     }
 
@@ -528,7 +539,6 @@ class TransfersPage(
         override fun getItemViewType(position: Int): Int = when (current[position]) {
             Decor.NewTaskCard -> 0
             is Decor.ClipCard -> 1
-            Decor.EmptyState -> 2
             is Decor.DecorTask -> 3
         }
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): TaskVh {
@@ -550,19 +560,8 @@ class TransfersPage(
             when (d) {
                 Decor.NewTaskCard -> bindNewTask()
                 is Decor.ClipCard -> bindClip(d.url)
-                Decor.EmptyState -> bindEmpty()
                 is Decor.DecorTask -> bindTask(d.task)
             }
-        }
-
-        private fun bindEmpty() {
-            val ctx = card.context
-            card.removeAllViews()
-            val tv = Ui.text(ctx, "暂无下载任务\n\n复制一个下载直链，或点上方按钮添加", 13f, Ui.TXT_SUB)
-            tv.gravity = Gravity.CENTER
-            card.addView(tv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                topMargin = Ui.dp(ctx, 30f); bottomMargin = Ui.dp(ctx, 30f)
-            })
         }
 
         private fun bindNewTask() {
@@ -685,6 +684,7 @@ class TransfersPage(
                         else -> Ui.BLUE
                     }
                 )
+                progressBackgroundTintList = android.content.res.ColorStateList.valueOf(Ui.BORDER)
             }
             card.addView(pb, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(ctx, 6f)))
 
