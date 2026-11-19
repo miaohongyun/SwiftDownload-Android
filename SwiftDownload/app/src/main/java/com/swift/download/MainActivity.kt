@@ -187,19 +187,22 @@ class MainActivity : AppCompatActivity() {
     private fun addTorrentFromUrl(url: String) {
         scope.launch(Dispatchers.IO) {
             try {
-                val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
-                conn.connectTimeout = 15000
-                conn.setRequestProperty(
-                    "User-Agent",
-                    HttpUtil.USER_AGENT
-                )
-                val bytes = conn.inputStream.use { it.readBytes() }
-                conn.disconnect()
-                val f = File(cacheDir, "seed_${System.currentTimeMillis()}.torrent")
-                f.writeBytes(bytes)
-                scope.launch {
-                    binder?.addTorrentFileTask(f.absolutePath)
-                    switchTo(1)
+                // v2.7 Stage0：统一走 HttpUtil —— 自带跨协议重定向、2xx 校验与 UA，
+                // 种子地址常从短链跳转，裸 HttpURLConnection 不跟随跳转会拿到 HTML 而非种子。
+                val conn = HttpUtil.open(url)
+                try {
+                    val code = conn.responseCode
+                    if (code !in 200..299) throw java.io.IOException("HTTP $code")
+                    val bytes = conn.inputStream.use { it.readBytes() }
+                    if (bytes.isEmpty()) throw java.io.IOException("种子内容为空")
+                    val f = File(cacheDir, "seed_${System.currentTimeMillis()}.torrent")
+                    f.writeBytes(bytes)
+                    scope.launch {
+                        binder?.addTorrentFileTask(f.absolutePath)
+                        switchTo(1)
+                    }
+                } finally {
+                    conn.disconnect()
                 }
             } catch (e: Exception) {
                 scope.launch { Ui.toast(this@MainActivity, "种子下载失败：${e.message}") }

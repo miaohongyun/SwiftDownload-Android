@@ -255,33 +255,31 @@ class FilesPage(
                 .setPositiveButton("确定") { _, _ ->
                     val n = et.text.toString().trim()
                     if (n.isEmpty() || n == f.name) return@setPositiveButton
-                    // v2.5.2：文件名必须是纯名字。允许 "../x" 这类输入会把文件移出下载目录，
-                    // 之后任务里的 save_path 就指向了一个不存在的位置（打开/投屏全部失败）
-                    if (n.contains('/') || n.contains('\\') || n == "." || n == "..") {
-                        Ui.toast(ctx, "文件名不能包含路径分隔符")
-                        return@setPositiveButton
-                    }
-                    // v2.6.0：拒绝以 . 开头的隐藏文件（与用户手册描述对齐），
-                    // 否则文件会从文件管理器/相册里"消失"，用户以为下载丢了
-                    if (n.startsWith('.')) {
-                        Ui.toast(ctx, "文件名不能以 . 开头（隐藏文件）")
+                    // v2.5.2 / v2.6.0 命名校验抽成纯函数（renameError），JVM 单测覆盖
+                    val err = renameError(n)
+                    if (err != null) {
+                        Ui.toast(ctx, err)
                         return@setPositiveButton
                     }
                     val target = File(f.parentFile, n)
                     if (target.exists()) {
                         Ui.toast(ctx, "同名文件已存在")
                     } else if (f.renameTo(target)) {
-                        // 同步数据库里的落盘路径，否则任务仍指向旧文件名
-                        try {
-                            com.swift.download.DownloadDatabase.get(ctx)
-                                .renameSavePath(f.absolutePath, target.absolutePath)
-                        } catch (e: Exception) {
-                            android.util.Log.w("FilesPage", "renameSavePath", e)
-                        }
-                        Ui.toast(ctx, "已重命名为 $n")
-                        refresh()
+                        syncRename(ctx, f.absolutePath, target.absolutePath, n)
                     } else {
-                        Ui.toast(ctx, "重命名失败")
+                        // v2.7 Stage0：Android 11+ 上 MediaStore 导出的公共文件常无法用
+                        // File.renameTo 改名（无公共目录写权限），回退到 ContentResolver.update(DISPLAY_NAME)。
+                        val exported = try {
+                            com.swift.download.DownloadDatabase.get(ctx).all()
+                                .firstOrNull { it.savePath == f.absolutePath }
+                        } catch (e: Exception) { null }
+                        if (exported != null && isContentUri(exported.exportUri) &&
+                            renameMediaStore(ctx, exported.exportUri, n)
+                        ) {
+                            syncRename(ctx, f.absolutePath, target.absolutePath, n)
+                        } else {
+                            Ui.toast(ctx, "重命名失败")
+                        }
                     }
                 }
                 .setNegativeButton("取消", null)
@@ -292,6 +290,40 @@ class FilesPage(
     companion object {
         /** 扫描最大深度：Download/ → 分类子目录 → BT/种子目录 → 内容目录 */
         private const val MAX_DEPTH = 4
+
+        /** 重命名命名校验（纯函数，JVM 单测覆盖）；null 表示合法 */
+        fun renameError(name: String): String? = when {
+            name.contains('/') || name.contains('\\') || name == "." || name == ".." ->
+                "文件名不能包含路径分隔符"
+            name.startsWith('.') -> "文件名不能以 . 开头（隐藏文件）"
+            else -> null
+        }
+
+        /** 是否 MediaStore content URI（v2.7 Stage0） */
+        fun isContentUri(uri: String): Boolean =
+            uri.startsWith("content://", ignoreCase = true)
+
+        /** 通过 MediaStore 改 DISPLAY_NAME；成功返回 true */
+        private fun renameMediaStore(ctx: Context, uri: String, name: String): Boolean = try {
+            val cv = android.content.ContentValues().apply {
+                put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, name)
+            }
+            ctx.contentResolver.update(android.net.Uri.parse(uri), cv, null, null)
+            true
+        } catch (e: Exception) {
+            android.util.Log.w("FilesPage", "renameMediaStore", e)
+            false
+        }
+
+        /** 同步数据库里的落盘路径，否则任务仍指向旧文件名 */
+        private fun syncRename(ctx: Context, oldPath: String, newPath: String, newName: String) {
+            try {
+                com.swift.download.DownloadDatabase.get(ctx).renameSavePath(oldPath, newPath)
+            } catch (e: Exception) {
+                android.util.Log.w("FilesPage", "renameSavePath", e)
+            }
+            Ui.toast(ctx, "已重命名为 $newName")
+        }
 
         /** 按扩展名给图标字形（存纯函数供单测参照：主要逻辑在 glyphOf/colorOf） */
         fun glyphOf(name: String): String = when (com.swift.download.MediaTypes.extOf(name)) {

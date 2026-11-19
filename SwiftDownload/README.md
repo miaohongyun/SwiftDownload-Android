@@ -36,7 +36,7 @@ BT 选文件、边下边播、DLNA 投屏、局域网投递、文件哈希校验
 ## 工程结构
 
 ```
-SwiftDownload-v2.6.0/
+SwiftDownload/
 ├── app/
 │   ├── libs/jlibtorrent-1.2.0.18.jar          # Java 层
 │   ├── src/main/jniLibs/                      # arm64-v8a / armeabi-v7a 原生库

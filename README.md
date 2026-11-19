@@ -6,8 +6,7 @@
 
 ## 当前版本
 
-**v2.6.0**（versionCode 11），源码位于 `SwiftDownload-v2.5.3/` —— 目录名是历史遗留，
-内部版本、文档与交付均以 v2.6.0 为准（该目录被本机进程占用，暂未改名）。
+**v2.6.0**（versionCode 11），源码位于 `SwiftDownload/`（目录名已去除版本号，永久规范化）。
 
 - 单元测试：**139/139 通过**
 - Git Tag：`v2.5.3`（清理前基线）、`v2.6.0`（当前版本）
@@ -16,7 +15,7 @@
 
 | 路径 | 说明 |
 | --- | --- |
-| `SwiftDownload-v2.5.3/` | **当前源码工程**（实际版本 v2.6.0），含完整文档与 139 个单元测试 |
+| `SwiftDownload/` | **当前源码工程**（v2.6.0），含完整文档与 139 个单元测试 |
 | `SwiftDownload-v2.6.0-Phase1..4.patch` | 四个阶段的独立补丁存档（仅本地，不入库） |
 | `SwiftDownload-v2.6.0.bundle` | 提交的可移植 Git bundle（仅本地，不入库） |
 
@@ -24,20 +23,20 @@
 
 ## 构建
 
-见 [`SwiftDownload-v2.5.3/README.md`](SwiftDownload-v2.5.3/README.md)。
+见 [`SwiftDownload/README.md`](SwiftDownload/README.md)。
 环境：JDK 17、Android SDK 36、Gradle 8.9（wrapper 已配置镜像）。
 
 ```bash
-cd SwiftDownload-v2.5.3
+cd SwiftDownload
 ./scripts/build.sh
 ```
 
 ## 文档入口
 
-- [用户手册](SwiftDownload-v2.5.3/docs/USER_GUIDE.md)
-- [架构说明](SwiftDownload-v2.5.3/docs/ARCHITECTURE.md)
-- [变更记录](SwiftDownload-v2.5.3/docs/CHANGELOG.md)
-- [回归报告](SwiftDownload-v2.5.3/docs/REGRESSION.md)
+- [用户手册](SwiftDownload/docs/USER_GUIDE.md)
+- [架构说明](SwiftDownload/docs/ARCHITECTURE.md)
+- [变更记录](SwiftDownload/docs/CHANGELOG.md)
+- [回归报告](SwiftDownload/docs/REGRESSION.md)
 
 ## 注意
 

@@ -7,6 +7,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- v2.7 Stage0：WifiManager.WifiLock 在部分 ROM 上要求 CHANGE_WIFI_STATE -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <!-- v2.2：DLNA SSDP 组播搜索（投屏设备发现，normal 权限） -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 
@@ -41,10 +43,14 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="magnet" />
             </intent-filter>
-            <!-- v2.0 新增：打开 .torrent 种子文件 -->
+            <!-- v2.0 新增：打开 .torrent 种子文件
+                 v2.7 Stage0：补 content/file scheme，消除 AppLinkUrlError（缺 URL 的 lint Error），
+                 同时让文件管理器经 content URI 分享的 .torrent 也能被正确接管 -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
                 <data android:mimeType="application/x-bittorrent" />
             </intent-filter>
         </activity>
